@@ -1,0 +1,20 @@
+# Extracted OAuth client — derived from the user's own agy binary at setup time.
+# NEVER commit this. It contains Google's Antigravity client_id/client_secret.
+antigravity-credentials.json
+
+# Login tokens the gateway writes.
+antigravity-accounts.json
+
+# Logs and backups that may capture secrets or session data.
+*.log
+*.bak
+*.bak*
+*~
+
+# Any stray creds/secrets.
+*.pem
+*.key
+*secret*
+*credentials*
+.env
+.env.*

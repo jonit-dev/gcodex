@@ -1,0 +1,43 @@
+# Layered on top of ~/.codex/config.toml by `codex --profile gcodex`.
+# Installed by setup.sh. Runs the Codex harness against Gemini 3.8 Flash via
+# your Google AI Pro subscription, through the local codex-antigravity-auth
+# gateway.
+#
+# Plain `codex` is untouched by this file — only `gcodex` uses it.
+
+model = "gemini-3.8-flash"
+model_provider = "antigravity"
+
+# The gateway maps effort into the backend model id, so the tier is chosen by
+# model id (gemini-3.8-flash{,-high,-low}), not by this field.
+model_reasoning_effort = "medium"
+model_reasoning_summary = "auto"
+
+[model_providers.antigravity]
+name = "Google Antigravity"
+base_url = "http://localhost:__PORT__/v1"
+wire_api = "responses"
+requires_openai_auth = false
+# Conservative on purpose: this is a subscription endpoint reached through an
+# unofficial gateway. Hammering it on errors is the fastest way to look like
+# abuse. Fewer retries, longer idle tolerance.
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 300000
+
+# Lean tool surface. Gemini is not post-trained on Codex's tool schemas, and
+# the stock surface is ~377 KB of tool JSON per request; a flash-tier foreign
+# model picks the right tool less reliably as that surface grows. Nothing is
+# lost — plain `codex` keeps everything, and a project's own .mcp.json still
+# loads per project.
+[features]
+apps = false
+multi_agent = false
+goals = false
+
+# A [mcp_servers.x] table in a profile REPLACES the base entry rather than
+# merging, so it must re-declare a transport or the config fails to load. This
+# placeholder is never spawned.
+[mcp_servers.blender]
+enabled = false
+command = "false"
