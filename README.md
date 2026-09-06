@@ -20,6 +20,13 @@ The provider lives in `~/.codex/gcodex.config.toml` and is selected with
 `codex --profile gcodex`, which layers that file over your existing
 `~/.codex/config.toml`.
 
+**Status.** Verified 2026-09-06 against `codex-antigravity-auth` 2.2.0 and
+Gemini 3.8 Flash: single-turn prompts, multi-turn tool loops, and `apply_patch`
+file edits all work with the gateway patch below applied.
+
+Built on [`codex-antigravity-auth`](https://pypi.org/project/codex-antigravity-auth/).
+Not affiliated with, endorsed by, or supported by Google or OpenAI.
+
 ---
 
 ## Requirements
