@@ -14,7 +14,7 @@ class HTTPError(Exception):
         self.status_code, self.detail, self.headers = status_code, detail, headers
 
 
-class QueueTests(unittest.IsolatedAsyncioTestCase):
+class QueueFixture(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         path = Path(__file__).resolve().parents[1] / 'gateway_safety.py'
         self.safety = runpy.run_path(str(path))
@@ -34,6 +34,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def pool(self, fn, *args):
         return fn(*args)
 
+
+class QueueTests(QueueFixture):
     async def test_busy_waits_locally_then_acquires(self):
         results = iter([None, {'email': 'test'}])
         self.manager._in_flight['test'] = 1
@@ -145,3 +147,36 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             self.safety['release_tracked_account'](self.manager, 'test')
         await self.safety['RequestLeaseMiddleware'](app)({'type': 'http'}, None, None)
         self.assertEqual(released, ['test'])
+
+
+class RotationTests(QueueFixture):
+    """Rotation runs while the request still owns the single slot.
+
+    Waiting there can never succeed, and raising out of a started SSE body
+    aborts the stream: the client sees a disconnect instead of the real
+    upstream error, which is exactly what these tests keep from returning.
+    """
+
+    async def test_busy_rotation_returns_none_without_waiting(self):
+        self.manager._in_flight['test'] = 1
+        with patch('asyncio.sleep', new_callable=AsyncMock) as sleep:
+            result = await self.safety['acquire_without_waiting'](self.manager, 'gemini', self.pool)
+        self.assertIsNone(result)
+        sleep.assert_not_awaited()
+
+    async def test_busy_rotation_does_not_raise_on_cooldown_or_auth_stop(self):
+        self.manager._in_flight['test'] = 1
+        self.data['gcodexAuthBlocked'] = True
+        self.data['accountState'] = {'cooldowns': {'test': {'gemini': time.time() + 60}}}
+        self.assertIsNone(
+            await self.safety['acquire_without_waiting'](self.manager, 'gemini', self.pool))
+
+    async def test_rotated_slot_is_released_with_the_request(self):
+        released = []
+        self.manager.acquire_account = lambda model: {'email': 'second'}
+        self.manager.release_account = released.append
+        async def app(scope, receive, send):
+            account = await self.safety['acquire_without_waiting'](self.manager, 'gemini', self.pool)
+            self.assertEqual(account, {'email': 'second'})
+        await self.safety['RequestLeaseMiddleware'](app)({'type': 'http'}, None, None)
+        self.assertEqual(released, ['second'])

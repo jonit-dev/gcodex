@@ -248,6 +248,43 @@ SERVER_EDITS = [
         '    return await acquire_serially(account_manager, model, run_in_threadpool)\n',
     ),
     (
+        'async def acquire_active_account_for_request(model: str) -> dict | None:\n'
+        '    from .gateway_safety import acquire_serially\n'
+        '    return await acquire_serially(account_manager, model, run_in_threadpool)\n',
+        'async def acquire_active_account_for_request(model: str) -> dict | None:\n'
+        '    from .gateway_safety import acquire_serially\n'
+        '    return await acquire_serially(account_manager, model, run_in_threadpool)\n'
+        '\n'
+        '\n'
+        'async def rotate_active_account_for_request(model: str) -> dict | None:\n'
+        '    from .gateway_safety import acquire_without_waiting\n'
+        '    return await acquire_without_waiting(account_manager, model, run_in_threadpool)\n',
+    ),
+    (
+        '                new_account = await acquire_active_account_for_request(model)\n'
+        '                rotation_attempted = True\n'
+        '                if new_account:\n'
+        '                    await record_attempt_outcome(\n',
+        '                new_account = await rotate_active_account_for_request(model)\n'
+        '                rotation_attempted = True\n'
+        '                if new_account:\n'
+        '                    await record_attempt_outcome(\n',
+    ),
+    (
+        '                new_account = await acquire_active_account_for_request(model)\n'
+        '                rotation_attempted = True\n'
+        '                if new_account:\n'
+        '                    response_attempts.append(new_account)\n',
+        '                new_account = await rotate_active_account_for_request(model)\n'
+        '                rotation_attempted = True\n'
+        '                if new_account:\n'
+        '                    response_attempts.append(new_account)\n',
+    ),
+    (
+        '                rotated = await acquire_active_account_for_request(model)\n',
+        '                rotated = await rotate_active_account_for_request(model)\n',
+    ),
+    (
         '        finally:\n            cancelled = any(\n',
         '        finally:\n'
         '            # Release in-memory leases before cancellable logging awaits.\n'

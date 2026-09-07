@@ -186,6 +186,45 @@ class Guards(unittest.TestCase):
 
 
 class InstalledGatewayIntegration(unittest.TestCase):
+    def pristine_copy(self, tmp):
+        """Patch a throwaway copy of the installed package's original sources."""
+        try:
+            installed = PATCH['find_package'](None)
+        except SystemExit:
+            self.skipTest('optional integration fixture: gateway is not installed')
+        pkg = Path(tmp) / 'codex_antigravity_auth'
+        pkg.mkdir()
+        for source in installed.glob('*.py'):
+            original = source.with_name(source.name + PATCH['BACKUP_SUFFIX'])
+            shutil.copy2(original if original.exists() else source, pkg / source.name)
+        return pkg
+
+    def test_rotation_cannot_raise_out_of_a_started_response(self):
+        # A rotation acquire runs while the request still holds the single
+        # slot, so a waiting acquire always times out; raising there kills an
+        # SSE body that already started and the client sees only a
+        # disconnected stream instead of the real upstream error.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            result = subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            tree = ast.parse((pkg / 'server.py').read_text())
+            waiting, rotating = [], []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id == 'acquire_active_account_for_request':
+                        waiting.append(node.lineno)
+                    elif node.func.id == 'rotate_active_account_for_request':
+                        rotating.append(node.lineno)
+            # Only the initial acquire precedes any response, so it alone may
+            # raise; every rotation must use the non-raising helper.
+            self.assertEqual(len(waiting), 1, f'waiting acquires at lines {waiting}')
+            self.assertEqual(len(rotating), 3, f'rotations at lines {rotating}')
+            stream = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
+                          and n.name == 'sse_generator')
+            self.assertNotIn(waiting[0], range(stream.lineno, stream.end_lineno + 1))
+
     def test_patch_upgrade_idempotence_and_real_account_state(self):
         try:
             installed = PATCH['find_package'](None)

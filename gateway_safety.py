@@ -94,6 +94,26 @@ def cooldown_remaining(data, model, now):
     return shortest or 0.0
 
 
+def _track(leases, manager, account):
+    if account is not None and leases is not None:
+        leases.append(RequestLease(manager, account.get('email')))
+    return account
+
+
+async def acquire_without_waiting(manager, model, run_in_threadpool):
+    """One acquire attempt for rotation: return None instead of raising.
+
+    Rotation runs while the request already holds the single slot, so waiting
+    can only burn the queue timeout, and raising out of a response body that
+    has already started tears the stream down: the caller never sees the real
+    upstream error, only a disconnected stream. Callers treat None as "no
+    alternative account", which is what a busy gateway means here.
+    """
+    leases = _REQUEST_LEASES.get()
+    account = await run_in_threadpool(manager.acquire_account, model)
+    return _track(leases, manager, account)
+
+
 async def acquire_serially(manager, model, run_in_threadpool):
     """Wait locally for a busy account, without retrying any Google request."""
     import asyncio
@@ -105,10 +125,7 @@ async def acquire_serially(manager, model, run_in_threadpool):
     deadline = loop.time() + QUEUE_TIMEOUT_SECONDS
     leases = _REQUEST_LEASES.get()
     def acquire_and_track():
-        account = manager.acquire_account(model)
-        if account is not None and leases is not None:
-            leases.append(RequestLease(manager, account.get('email')))
-        return account
+        return _track(leases, manager, manager.acquire_account(model))
     next_state_read = None
     while True:
         account = await run_in_threadpool(acquire_and_track)

@@ -39,6 +39,24 @@ served. Six direct requests issued while a session held the slot returned 429
 `cooling down` on the first attempt before the fix and 200 on every attempt
 after it.
 
+A mid-stream account rotation can no longer kill the stream. `acquire_serially`
+replaced upstream's non-raising `acquire_account` at every call site, but three
+of them are *rotation* attempts that upstream treats as "no alternative account"
+when they return `None`. Rotation runs while the request still holds the single
+slot (`AccountState._select` allows one in-flight per account, and the lease is
+released only in `managed_sse_generator`'s `finally`), so the waiting acquire
+could never succeed: it burned the full 30-second queue timeout and then raised
+`429 gateway busy` from inside an SSE body that had already started. Starlette
+turns that into `RuntimeError: Caught handled exception, but response already
+started` and aborts the connection, so Codex reported `stream disconnected
+before completion` and exited 1 instead of receiving the real upstream error —
+and nothing was written to the request log, because the crash preceded
+`log_request`. Four such aborts were recorded in one gateway log. Rotation now
+calls `rotate_active_account_for_request`, a non-waiting, non-raising helper;
+only the initial acquire, which runs before any response begins, still raises.
+A regression test walks the patched `server.py` AST and fails against the
+previous patcher, naming all three bad call sites.
+
 Warm signature-cache hits now check expiry and refresh the durable last-use
 timestamp. Two regression tests first reproduced the prior inconsistency:
 expired signatures remained usable in memory, while recently used signatures
