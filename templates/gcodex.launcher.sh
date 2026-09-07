@@ -108,22 +108,25 @@ catalog_override="$(python3 "$CATALOG_HELPER" "$PORT" "$(dirname "$CONFIG")/gcod
 # ---------------------------------------------------------------------------
 trim=()
 if [[ "${GCODEX_SKILLS:-0}" != "1" ]]; then
-  # Prefer a keep-list if the user maintains one: skills.config is a per-skill
-  # override layered on "everything enabled", not an allowlist, so the helper
-  # names every skill NOT kept. With no keep-list, drop the catalog entirely --
-  # include_instructions=false does that cleanly, whereas skills.enabled=false
-  # is accepted but changes nothing and a squeezed max_context_tokens still
-  # prints "Exceeded skills context budget" on every run.
+  # Drop the catalog from the prompt, but leave every skill installed AND
+  # enabled so `$name` in the composer still finds it. The obvious trim --
+  # skills.config with enabled=false for everything outside the keep-list --
+  # costs the same prompt bytes and also deletes those skills from the `$`
+  # picker, so a user cannot reach them by hand either. include_instructions
+  # keeps them one keystroke away. (skills.enabled=false is accepted and
+  # changes nothing; a squeezed max_context_tokens just prints "Exceeded
+  # skills context budget" on every run.)
+  trim+=(-c "skills.include_instructions=false")
+  # The keep-list is then re-advertised to the model by appending it to the
+  # profile's own developer_instructions, so the handful of skills you rely on
+  # stay discoverable without the other two hundred riding along.
   SKILLS_KEEP="$(dirname "$CONFIG")/gcodex.skills"
   SKILLS_POLICY="$(dirname "$CONFIG")/gcodex-skills-policy.py"
-  skills_override=""
   if [[ -r "$SKILLS_KEEP" && -r "$SKILLS_POLICY" ]]; then
-    skills_override="$(python3 "$SKILLS_POLICY" "$SKILLS_KEEP" 2>/dev/null || true)"
-  fi
-  if [[ -n "$skills_override" ]]; then
-    trim+=(-c "$skills_override")
-  else
-    trim+=(-c "skills.include_instructions=false")
+    skills_override="$(python3 "$SKILLS_POLICY" "$SKILLS_KEEP" --config "$CONFIG" 2>/dev/null || true)"
+    if [[ -n "$skills_override" ]]; then
+      trim+=(-c "$skills_override")
+    fi
   fi
 fi
 if [[ "${GCODEX_MCP:-0}" != "1" ]]; then

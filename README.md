@@ -20,7 +20,7 @@ The provider lives in `~/.codex/gcodex.config.toml` and is selected with
 `codex --profile gcodex`, which layers that file over your existing
 `~/.codex/config.toml`.
 
-**Status.** Verified 2026-09-06 against `codex-antigravity-auth` 2.2.0 and
+**Status.** Verified 2026-09-07 against `codex-antigravity-auth` 2.2.0 and
 Gemini 3.8 Flash: single-turn prompts, multi-turn tool loops, and `apply_patch`
 file edits all work with the gateway patch below applied.
 
@@ -101,7 +101,9 @@ python3 patch-gateway.py --revert     # restore pristine files
 The patch also enforces one stored account, at most one in-flight request per
 gateway process, and a persistent stop after an authentication failure. Busy
 requests wait locally for up to 30 seconds, then receive a clear busy response;
-they do not generate additional Google requests while waiting. Body
+a rate-limited request waits out its recorded cooldown (see
+[Rate limits](#rate-limits-429)). Neither generates additional Google requests
+while waiting. Body
 dumps are disabled; applying this version removes the old dump hooks.
 `--check` exits nonzero if any patch is incomplete or legacy dump hooks remain.
 All anchors and Python syntax are validated before writing; write failures
@@ -196,10 +198,8 @@ GCODEX_MCP=1 gcodex          # keep the MCP servers from your base config
 ```
 
 **Skills.** Name the ones you want in `~/.codex/gcodex.skills`, one per line.
-Only those are kept for `gcodex`; plain `codex` is untouched. An empty file
-drops the catalog entirely. Skills are still *on disk* either way -- what is
-removed is the model's ability to discover them by itself, so you can always
-point at a `SKILL.md` by path. Measured on this machine:
+Those are advertised to the model; plain `codex` is untouched. An empty file
+advertises none. Measured on this machine:
 
 | Keep-list | Input tokens per request |
 | --- | ---: |
@@ -207,14 +207,58 @@ point at a `SKILL.md` by path. Measured on this machine:
 | 24 actively-used skills | 6,673 |
 | Empty (catalog dropped) | 2,209 |
 
-`skills.config` is a per-skill override on top of "everything enabled", not an
-allowlist, so `skills-policy.py` names every skill you did *not* keep and
-regenerates that list whenever your installed skills change. Note that
-`skills.enabled=false` is accepted by Codex and does nothing, and shrinking
+**Nothing is disabled, so tagging still works.** Type `$` in the composer and
+every installed skill is still there to pick, keep-list or not — a tagged skill
+costs nothing until you use it, so there is no reason to hide it from you. The
+trim is `skills.include_instructions=false`, which drops the catalog from the
+prompt while leaving each skill installed and enabled; `skills-policy.py` then
+appends the keep-list to the profile's `developer_instructions` so the model
+still knows those exist. The earlier approach — `skills.config` with
+`enabled=false` for everything outside the keep-list — cost the same bytes and
+also removed those skills from the `$` picker. Note that `skills.enabled=false`
+is accepted by Codex and does nothing, and shrinking
 `skills.max_context_tokens` prints `Exceeded skills context budget` on each run.
 
 **MCP servers.** Disabled by name, discovered from your config rather than
 hardcoded, so the trim follows whatever you have installed.
+
+---
+
+## Rate limits (429)
+
+A rate limit is a wait, not a verdict. Codex is configured with zero retries
+here on purpose, so an unhandled 429 ends the turn and you retype the prompt.
+The patched gateway instead **pauses and sends one request when the cooldown
+expires**:
+
+- Upstream records a cooldown on a 429 — 120s, doubling per consecutive
+  failure, capped at 1920s (or Google's `Retry-After`, whichever is longer).
+- If the limit lands before any output has reached you, the gateway holds the
+  open stream, sleeps that long, and retries on the slot it already owns. One
+  request goes out, when the cooldown says it may. Nothing is sent while
+  waiting, and the account is never asked twice at once.
+- Once tokens have already been streamed, a retry would duplicate them, so the
+  failure is reported as before.
+- A request that arrives while a cooldown is still live waits it out the same
+  way before anything is sent.
+
+Each request has a wait budget, `GCODEX_COOLDOWN_WAIT` (default 900s, read by
+the gateway process at start). A cooldown longer than the remaining budget —
+the deep end of the backoff, or a quota that resets on a multi-day cycle — is
+reported as a 429 with `Retry-After` rather than held open. The profile's
+`stream_idle_timeout_ms` is set to 20 minutes to cover the pause; Codex 0.153.4
+was verified against a stub provider to accept 900s of silence before the first
+event and still render the answer.
+
+The pause is visible in the gateway log
+(`~/.codex/antigravity-gateway-<port>.log`):
+
+```
+[*] gcodex: rate limited; waiting 121s before retrying this turn
+```
+
+Codex itself shows nothing during the wait, so a turn that seems to hang is
+worth checking against that log before assuming it died.
 
 ---
 
@@ -236,6 +280,9 @@ Mitigations baked into gcodex:
   `stream_max_retries` to zero. The gateway retains upstream rate-limit cooldowns
   and stops persistently after authentication failures, including 401/403.
   This stop survives gateway restarts and ordinary cooldown expiry.
+- **Rate limits pause instead of retrying.** A 429 makes the gateway wait out
+  the recorded cooldown and then send *one* request, rather than the client
+  retrying (see below). The wait is local: nothing reaches Google during it.
 
 After resolving an authentication error, deliberately clear the stop using the
 gateway's Python interpreter (for the default uv installation):
@@ -309,6 +356,12 @@ feature flag rather than on the model. `goals` is enabled; `apps` and
 `multi_agent` are not, so their commands stay hidden here while plain `codex`
 keeps them. Check the `[features]` block in `~/.codex/gcodex.config.toml`, and
 re-run `./setup.sh` if it does not match `templates/gcodex.config.toml`.
+
+**A turn sits there for minutes with no output.**
+Most likely the gateway is waiting out a rate-limit cooldown, which is the
+intended behaviour. `tail -f ~/.codex/antigravity-gateway-51122.log` and look
+for `gcodex: rate limited; waiting`. Set `GCODEX_COOLDOWN_WAIT=0` before
+starting the gateway if you would rather have the 429 back immediately.
 
 **General health check.**
 Run `agy -p "hi"` first. If that returns a Gemini response, your account is

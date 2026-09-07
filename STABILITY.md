@@ -1,4 +1,4 @@
-# Real-usage verification — 2026-09-06
+# Real-usage verification — 2026-09-07
 
 Verified with Codex CLI 0.153.4, codex-antigravity-auth 2.2.0, and the installed
 Gemini 3.8 Flash medium/high/low catalog entries.
@@ -10,7 +10,7 @@ Gemini 3.8 Flash medium/high/low catalog entries.
 | Effort selection | Low and high each ran the fixture tests successfully; medium handled the edit/resume workflows. |
 | Concurrent clients | Two clients started simultaneously and both returned their expected markers. Local tests verify waiting, timeout, and cancellation without releasing another request's slot. |
 | HTTP disconnect recovery | A localhost FastAPI/uvicorn fixture using the actual lease middleware completed 20 stream-disconnect/follow-up cycles and eight concurrent follow-ups: 48 acquisitions, 48 releases, zero slots left occupied, peak occupancy one. It uses a fake account manager and makes no Google requests. |
-| Local regressions | 71 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
+| Local regressions | 93 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
 
 ## Fixes made during iteration
 
@@ -72,6 +72,51 @@ The initial native-edit probe exposed a false completion claim by the model;
 independent file checks caught it. The metadata fix made the actual native tool
 available, after which the file creation and resumed edit both succeeded.
 
+A rate limit no longer ends the turn. Upstream records a cooldown on a 429 (120s
+doubling per consecutive failure to 1920s, or Google's `Retry-After`), and both
+the pre-request acquire and the mid-stream failure path turned that into an
+immediate `429` for a client configured with zero retries — so the turn died and
+the prompt had to be retyped, with no request having reached Google. Both paths
+now wait the recorded cooldown out and then send exactly one request: the
+pre-request wait happens before anything is sent, and the mid-stream retry runs
+only while `visible_output_started` is false, on the slot the request already
+owns, so no output is ever duplicated and the account is never asked twice at
+once. Each request carries a wait budget (`GCODEX_COOLDOWN_WAIT`, default 900s);
+a cooldown longer than what is left of it is still reported as a 429 with
+`Retry-After`.
+
+Evidence: a 45-second cooldown was written into the real account store and
+`gcodex exec` then answered in 44 seconds, with
+`[*] gcodex: waiting out a 41s cooldown before sending anything to Google` in
+the gateway log; before the change the same state returned `429 ... cooling
+down` at once. Six regression tests cover the waiting acquire, the budget
+ceiling, and a cooldown that keeps being extended; two more execute the real
+patched `sse_generator` from the installed sources against a stubbed transport
+that fails with 429 once — it retries after one sleep with the fix and makes a
+single attempt without it, and a rate limit arriving after visible output is
+still reported rather than retried.
+
+The pause is only safe because the client tolerates the silence. Codex 0.153.4
+was measured against a stub Responses provider that withheld its answer for 180s
+before the response headers and for 180s after them, and then for the full 900s
+budget after them: all three completed and rendered the answer, exit 0 (903s
+wall clock for the last). The profile's `stream_idle_timeout_ms` is now 20
+minutes so the longest permitted wait fits inside it.
+
+Skill tagging survives the prompt trim. The trim used to disable every skill
+outside `~/.codex/gcodex.skills` with `skills.config`, which also removed them
+from the `$` picker in the composer: typing `$audit` under gcodex returned "no
+matches", so a skill you had chosen deliberately was unreachable even by name.
+The catalog is now dropped with `skills.include_instructions=false` — same
+prompt saving, nothing disabled — and the keep-list is appended to the profile's
+`developer_instructions` instead, so the model still knows those skills exist.
+Verified live: `$audit` under gcodex now lists `seo-audit`, `squirrelscan` and
+`feature-mining-sandbox-validation`, none of them in the keep-list; and a tagged
+skill's SKILL.md arrives in the request as a `<skill>` block with its path,
+confirmed by dumping the request body at a stub provider. A separate dump
+confirms the injected block carries both the profile's own verification guidance
+and the keep-list entries.
+
 ## Practical limits
 
 The later [harness-comparison pilot](benchmarks/README.md) exposed a local busy
@@ -111,7 +156,7 @@ Run the real-socket disconnect probe using the gateway environment's Python
 
 The probe binds an ephemeral loopback port, does not read account storage or
 credentials, and stops its fixture server after testing. This is a separate
-integration check, not included in the 71 dependency-free regression tests.
+integration check, not included in the 93 dependency-free regression tests.
 Adding `--negative-control` deliberately disables only the fixture's middleware
 and shortens its local queue timeout: the first follow-up fails with HTTP 429.
 That expected failure was observed, confirming the probe detects the leaked-slot

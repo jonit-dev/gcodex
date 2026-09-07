@@ -2,12 +2,39 @@
 from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass
+import os
 
 BLOCK_KEY = "gcodexAuthBlocked"
 QUEUE_TIMEOUT_SECONDS = 30
 # A waiter re-reads persisted account state at most this often while queueing.
 STATE_POLL_SECONDS = 1.0
 _REQUEST_LEASES = ContextVar('gcodex_request_leases', default=None)
+
+
+def _seconds_from_env(name, default):
+    """Read a non-negative seconds value from the environment, else `default`."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+# A rate limit is a wait, not a verdict. Upstream records a cooldown -- 120s
+# doubling per consecutive failure, capped at 1920s -- and the unpatched
+# gateway turns that into an immediate 429, which ends the Codex turn because
+# the profile deliberately allows no client retries. Waiting the cooldown out
+# inside the gateway keeps the turn alive without sending Google anything
+# extra: the pause is local and exactly one request is sent when the cooldown
+# expires. A mid-stream retry keeps the slot it already holds; a request still
+# waiting to start holds none.
+COOLDOWN_WAIT_SECONDS = _seconds_from_env("GCODEX_COOLDOWN_WAIT", 900.0)
+# Used when a rate limit arrives without a recorded cooldown to read, so the
+# retry still backs off instead of answering Google immediately.
+RATE_LIMIT_FALLBACK_PAUSE_SECONDS = _seconds_from_env("GCODEX_RATE_LIMIT_PAUSE", 60.0)
 
 
 @dataclass
@@ -114,8 +141,36 @@ async def acquire_without_waiting(manager, model, run_in_threadpool):
     return _track(leases, manager, account)
 
 
+def log_pause(message):
+    """Say why the gateway is idle, so a long wait is not mistaken for a hang."""
+    print("[*] gcodex: " + message, flush=True)
+
+
+async def rate_limit_pause_seconds(model, run_in_threadpool, budget):
+    """Seconds to wait before retrying a rate-limited attempt; None to give up.
+
+    Called after the failed attempt's cooldown has been recorded, so the
+    recorded value is what upstream itself wants us to wait. Returning None
+    hands the caller back to its existing failure path.
+    """
+    import time
+    from .storage import load_accounts_read_only
+
+    if budget <= 0:
+        return None
+    data = await run_in_threadpool(load_accounts_read_only)
+    if not account_allowed(data):
+        return None
+    remaining = cooldown_remaining(data, model, time.time())
+    if remaining <= 0:
+        remaining = RATE_LIMIT_FALLBACK_PAUSE_SECONDS
+    if remaining <= 0 or remaining > budget:
+        return None
+    return remaining
+
+
 async def acquire_serially(manager, model, run_in_threadpool):
-    """Wait locally for a busy account, without retrying any Google request."""
+    """Wait locally for a busy or cooling account, sending Google nothing."""
     import asyncio
     import time
     from fastapi import HTTPException
@@ -127,6 +182,7 @@ async def acquire_serially(manager, model, run_in_threadpool):
     def acquire_and_track():
         return _track(leases, manager, manager.acquire_account(model))
     next_state_read = None
+    wait_budget = COOLDOWN_WAIT_SECONDS
     while True:
         account = await run_in_threadpool(acquire_and_track)
         if account is not None:
@@ -143,8 +199,25 @@ async def acquire_serially(manager, model, run_in_threadpool):
                 raise HTTPException(409, "gcodex: exactly one Google account must be stored")
             remaining = cooldown_remaining(data, model, time.time())
             if remaining > 0:
-                raise HTTPException(429, "gcodex: account is cooling down; no request sent to Google",
-                                    headers={"Retry-After": str(max(1, int(remaining) + 1))})
+                # Pause here instead of failing the turn. Nothing reaches
+                # Google while we sleep; no slot is held during the wait, so
+                # when the cooldown expires this request competes for the
+                # single slot like any other and falls back to the busy wait
+                # below if another turn took it first.
+                if remaining > wait_budget:
+                    raise HTTPException(
+                        429,
+                        f"gcodex: account is cooling down for {int(remaining) + 1}s, longer than the "
+                        f"{int(COOLDOWN_WAIT_SECONDS)}s this gateway waits; no request sent to Google",
+                        headers={"Retry-After": str(max(1, int(remaining) + 1))})
+                log_pause("waiting out a %ds cooldown before sending anything to Google" % (int(remaining) + 1))
+                wait_budget -= remaining
+                await asyncio.sleep(remaining)
+                # The wait is not queue contention: give the busy check its
+                # full window again, and re-read state on the next pass.
+                deadline = loop.time() + QUEUE_TIMEOUT_SECONDS
+                next_state_read = None
+                continue
         if loop.time() < deadline:
             await asyncio.sleep(0.1)
             continue

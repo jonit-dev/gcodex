@@ -142,9 +142,11 @@ sed "s|__PORT__|$GATEWAY_PORT|g" "$HERE/templates/gcodex.config.toml" > "$CONFIG
 
 # Skill keep-list. Codex sends every installed skill's description on every
 # model call; on a per-request subscription quota that is the largest single
-# cost in the request. An empty keep-list means "send none of them", which is
-# the safe default -- the skills stay on disk and can still be used by naming
-# their SKILL.md. Never overwrite a list the user has already curated.
+# cost in the request. The launcher drops that catalog and re-advertises only
+# the skills named here. Nothing is ever disabled: every skill stays installed,
+# enabled and reachable with `$name` in the composer, so an empty keep-list
+# means "the model discovers none of them", not "you lost them". Never
+# overwrite a list the user has already curated.
 SKILLS_KEEP="$GCODEX_HOME/gcodex.skills"
 if [[ ! -e "$SKILLS_KEEP" ]]; then
   say "Seeding empty skill keep-list -> $SKILLS_KEEP"
@@ -152,10 +154,13 @@ if [[ ! -e "$SKILLS_KEEP" ]]; then
 # gcodex skill keep-list — one skill name per line, '#' starts a comment.
 #
 # Codex ships every installed skill's name and description in the prompt on
-# EVERY model call. Only the skills named here are kept for gcodex; the rest
-# are disabled for gcodex only. Plain `codex` is untouched.
+# EVERY model call. gcodex drops that catalog and re-advertises only the skills
+# named here. Plain `codex` is untouched.
 #
-# Empty file = drop the skill catalog entirely (smallest prompt).
+# Nothing is disabled: every installed skill is still reachable by typing
+# `$name` in the composer, whether or not it is listed here.
+#
+# Empty file = the model is told about no skills (smallest prompt).
 # GCODEX_SKILLS=1 restores the full catalog for a single run.
 SKILLS_EOF
   chmod 600 "$SKILLS_KEEP"

@@ -54,11 +54,12 @@ class Credentials(unittest.TestCase):
 
 
 class Launcher(unittest.TestCase):
-    def run_launcher(self, *args, catalog_failure=False, env=None, servers=''):
+    def run_launcher(self, *args, catalog_failure=False, env=None, servers='', config=None):
         source = (ROOT / "templates/gcodex.launcher.sh").read_text()
         # Keep argument parsing and exec intact; replace only external commands
         # with subprocess-local shell functions and the final exec for capture.
-        source = source.replace('CONFIG="${CODEX_HOME:-$HOME/.codex}/${PROFILE}.config.toml"', 'CONFIG=/dev/null')
+        source = source.replace('CONFIG="${CODEX_HOME:-$HOME/.codex}/${PROFILE}.config.toml"',
+                                'CONFIG=%s' % (config or '/dev/null'))
         source = source.replace('CREDS="$HOME/.codex/antigravity-credentials.json"', 'CREDS=/dev/null')
         source = source.replace('exec codex ', 'codex ')
         source = source.replace('CATALOG_HELPER="$(dirname "$CONFIG")/gcodex-model-catalog.py"', 'CATALOG_HELPER=/dev/null')
@@ -69,7 +70,9 @@ models) %s echo '- gemini-3.8-flash: default'; echo '- gemini-3.8-flash-high: hi
 esac
 }
 codex() { printf '%%s\\0' "$@"; }
-python3() { if [ "$1" = "-" ]; then cat > /dev/null; printf '%%s\n' $FAKE_SERVERS; else echo 'model_catalog_json="/unused"'; fi; }
+python3() { if [ "$1" = "-" ]; then cat > /dev/null; printf '%%s\n' $FAKE_SERVERS;
+elif [ "${1##*/}" = "gcodex-skills-policy.py" ]; then command python3 "$@";
+else echo 'model_catalog_json="/unused"'; fi; }
 ''' % ('return 1;' if catalog_failure else '')
         environment = dict(os.environ, FAKE_SERVERS=servers)
         environment.setdefault('GCODEX_SKILLS', '0')
@@ -224,6 +227,113 @@ class InstalledGatewayIntegration(unittest.TestCase):
             stream = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
                           and n.name == 'sse_generator')
             self.assertNotIn(waiting[0], range(stream.lineno, stream.end_lineno + 1))
+
+    def run_patched_stream(self, pkg, *, failures, visible_output):
+        """Drive the patched sse_generator with a stubbed Google transport.
+
+        Returns (chunks, attempts, sleeps). `failures` is how many leading
+        attempts raise HTTP 429 before one succeeds.
+        """
+        tree = ast.parse((pkg / 'server.py').read_text())
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name == 'sse_generator')
+        completed = {'type': 'response.completed', 'response': {'id': 'r', 'usage': {}}}
+        attempts, sleeps, failed_events = [], [], []
+
+        class HTTPError(Exception):
+            status_code = 429
+            response = None
+            outcome = types.SimpleNamespace(scope='family', category='rate_limit')
+
+        class Adapter:
+            visible_output_started = visible_output
+            created_emitted = True
+            def reset_attempt(self): pass
+            def created(self): return {'type': 'response.created'}
+            def fail(self, code, message):
+                failed_events.append((code, message))
+                return [{'type': 'response.failed'}]
+
+        async def stream_events(codex_req, lease, **kwargs):
+            attempts.append(lease)
+            if len(attempts) <= failures:
+                raise HTTPError()
+            yield completed
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+
+        async def pause(model, pool, budget):
+            return 0.5 if budget > 0 else None
+
+        modules = {
+            'stream_fixture.custom_tools': types.SimpleNamespace(
+                CustomToolDecoder=lambda codex_req: (lambda event: event)),
+            'stream_fixture.gateway_safety': types.SimpleNamespace(
+                COOLDOWN_WAIT_SECONDS=900, log_pause=lambda message: None,
+                rate_limit_pause_seconds=pause),
+        }
+        namespace = dict(
+            __package__='stream_fixture', AsyncGenerator=__import__('typing').AsyncGenerator,
+            json=json, model='gemini-3.8-flash', family='gemini', codex_req={},
+            stream_attempts=[{'email': 'test'}], attempt_num=0,
+            GoogleStreamEventAdapter=lambda **kwargs: Adapter(),
+            GoogleHTTPError=HTTPError, GoogleStreamPayloadError=type('Payload', (Exception,), {}),
+            AttemptOutcome=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            google_transport=types.SimpleNamespace(stream_events=stream_events),
+            account_lease=lambda account: account,
+            is_validation_required_error=lambda status, text: False,
+            retry_after_seconds_from_response=lambda response: None,
+            run_in_threadpool=None,
+            record_stream_attempt=self.noop, log_request=self.noop,
+            rotate_active_account_for_request=self.none,
+            release_account_for_request=self.noop,
+        )
+        with patch.dict(__import__('sys').modules, modules):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), 'server.py', 'exec'), namespace)
+            async def drain():
+                with patch('asyncio.sleep', sleep):
+                    return [chunk async for chunk in namespace['sse_generator']()]
+            chunks = asyncio.run(drain())
+        return chunks, attempts, sleeps, failed_events
+
+    @staticmethod
+    async def noop(*args, **kwargs):
+        return None
+
+    @staticmethod
+    async def none(*args, **kwargs):
+        return None
+
+    def test_rate_limited_stream_waits_and_retries(self):
+        # The profile allows the client no retries, so reporting a 429 ends the
+        # turn. Nothing has been shown to the user yet at this point, so the
+        # gateway may hold the stream open, sleep off the cooldown, and send
+        # exactly one more request.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            result = subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            chunks, attempts, sleeps, failed = self.run_patched_stream(
+                pkg, failures=1, visible_output=False)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(sleeps, [0.5])
+            self.assertEqual(failed, [])
+            self.assertIn('response.completed', ''.join(chunks))
+
+    def test_rate_limit_after_visible_output_is_not_retried(self):
+        # Once tokens have shipped, a second attempt would repeat them, so the
+        # failure has to reach the client as it did before.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)], check=True,
+                           capture_output=True)
+            chunks, attempts, sleeps, failed = self.run_patched_stream(
+                pkg, failures=1, visible_output=True)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(sleeps, [])
+            self.assertEqual([code for code, _ in failed], ['rate_limit'])
 
     def test_patch_upgrade_idempotence_and_real_account_state(self):
         try:
@@ -396,6 +506,50 @@ class LauncherPromptTrim(unittest.TestCase):
     def test_user_arguments_still_reach_codex_after_the_trim(self):
         result = self.run_launcher('exec', '--', '--high', servers='playwright')
         self.assertEqual(result.stdout.split(b'\0')[-4:-1], [b'exec', b'--', b'--high'])
+
+    def profile_with_keep_list(self, keep):
+        """A profile directory holding the keep-list and the policy helper."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        config = home / 'gcodex.config.toml'
+        config.write_text('model = "gemini-3.8-flash"\ndeveloper_instructions = "Base rule."\n')
+        (home / 'gcodex.skills').write_text(keep)
+        shutil.copy2(ROOT / 'skills-policy.py', home / 'gcodex-skills-policy.py')
+        skills = home / 'skills'
+        (skills / 'kept').mkdir(parents=True)
+        (skills / 'kept' / 'SKILL.md').write_text('---\ndescription: kept skill\n---\n')
+        (skills / 'dropped').mkdir(parents=True)
+        (skills / 'dropped' / 'SKILL.md').write_text('---\ndescription: dropped skill\n---\n')
+        return home, config
+
+    def test_keep_list_is_advertised_without_disabling_anything(self):
+        # Disabling the rest would trim the same bytes and also remove them
+        # from the composer's `$` picker, so tagging one by hand would stop
+        # working. Nothing may be disabled per skill.
+        home, config = self.profile_with_keep_list('kept\n')
+        result = self.run_launcher('exec', 'hi', config=config,
+                                   env={'CODEX_HOME': str(home)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.split(b'\0')
+        self.assertIn(b'skills.include_instructions=false', args)
+        self.assertNotIn(b'skills.config', result.stdout)
+        self.assertNotIn(b'enabled=false', result.stdout.replace(b'mcp_servers', b''))
+        advertised = [a for a in args if a.startswith(b'developer_instructions=')]
+        self.assertEqual(len(advertised), 1, args)
+        self.assertIn(b'Base rule.', advertised[0])
+        self.assertIn(b'- kept: kept skill', advertised[0])
+        self.assertNotIn(b'dropped', advertised[0])
+
+    def test_empty_keep_list_advertises_nothing(self):
+        home, config = self.profile_with_keep_list('# nothing kept\n')
+        result = self.run_launcher('exec', 'hi', config=config,
+                                   env={'CODEX_HOME': str(home)})
+        # An empty keep-list adds nothing and still launches codex.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.split(b'\0')
+        self.assertIn(b'skills.include_instructions=false', args)
+        self.assertEqual([a for a in args if a.startswith(b'developer_instructions=')], [])
 
     def test_no_servers_declared_adds_no_server_flags(self):
         result = self.run_launcher('exec', 'hi', servers='')

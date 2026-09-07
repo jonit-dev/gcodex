@@ -303,6 +303,47 @@ SERVER_EDITS = [
         '                    await release_account_for_request(email)\n',
         '                # No second release: a new request may own this slot.\n',
     ),
+    (
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        attempt_num = 0\n',
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        import asyncio\n'
+        '        from .gateway_safety import COOLDOWN_WAIT_SECONDS, log_pause, rate_limit_pause_seconds\n'
+        '        rate_limit_budget = COOLDOWN_WAIT_SECONDS\n'
+        '        attempt_num = 0\n',
+    ),
+    (
+        '            stream_account = stream_attempts[attempt_num]\n'
+        '            terminal_event: dict | None = None\n',
+        '            stream_account = stream_attempts[attempt_num]\n'
+        '            terminal_event: dict | None = None\n'
+        "            # Only this attempt's own failure may trigger a rate-limit\n"
+        '            # wait; a stream that ends without a terminal event reaches\n'
+        '            # the same code with no outcome of its own.\n'
+        '            outcome = None\n',
+    ),
+    (
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+        '            # A rate limit is a wait, not a verdict: pause the turn here\n'
+        '            # rather than failing it, since the profile allows the client\n'
+        '            # no retries of its own. Nothing is sent to Google while we\n'
+        '            # sleep, and the retry reuses the slot this request already\n'
+        '            # holds, so the account is never asked twice at once. Only\n'
+        '            # before any visible output -- once tokens have shipped, a\n'
+        '            # second attempt would duplicate them.\n'
+        '            if (outcome is not None and outcome.category == "rate_limit"\n'
+        '                    and not adapter.visible_output_started):\n'
+        '                pause = await rate_limit_pause_seconds(model, run_in_threadpool, rate_limit_budget)\n'
+        '                if pause is not None:\n'
+        '                    rate_limit_budget -= pause\n'
+        '                    log_pause("rate limited; waiting %ds before retrying this turn" % (int(pause) + 1))\n'
+        '                    await asyncio.sleep(pause)\n'
+        '                    adapter.reset_attempt()\n'
+        '                    continue\n'
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+    ),
 ]
 
 CUSTOM_TRANSFORM_EDITS = [
