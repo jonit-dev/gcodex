@@ -24,7 +24,7 @@ set -euo pipefail
 
 PROFILE="gcodex"
 CONFIG="${CODEX_HOME:-$HOME/.codex}/${PROFILE}.config.toml"
-CREDS="${CODEX_HOME:-$HOME/.codex}/antigravity-credentials.json"
+CREDS="$HOME/.codex/antigravity-credentials.json"
 PORT="__PORT__"
 MODEL="${GCODEX_MODEL:-gemini-3.8-flash}"
 
@@ -37,11 +37,16 @@ MODEL="${GCODEX_MODEL:-gemini-3.8-flash}"
 rest=()
 while (( $# )); do
   case "$1" in
+    --) rest+=("$@"); break ;;
     --high) MODEL="gemini-3.8-flash-high" ;;
     --low)  MODEL="gemini-3.8-flash-low" ;;
     --med|--medium) MODEL="gemini-3.8-flash" ;;
-    -m|--model) shift; MODEL="${1:-$MODEL}" ;;
-    -m=*|--model=*) MODEL="${1#*=}" ;;
+    -m|--model)
+      [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "gcodex: $1 requires a model id" >&2; exit 2; }
+      shift; MODEL="$1" ;;
+    -m=*|--model=*)
+      MODEL="${1#*=}"
+      [[ -n "$MODEL" ]] || { echo "gcodex: model id must not be empty" >&2; exit 2; } ;;
     *) rest+=("$1") ;;
   esac
   shift
@@ -67,10 +72,79 @@ codex-antigravity status --port "$PORT" 2>/dev/null | grep -q "reachable: yes" \
 # Validate the model against the gateway catalog. A foreign id (gpt-*, o1,
 # luna, sol, ...) is not served by Antigravity and returns HTTP 404 mid-stream,
 # so fall back to the Gemini default with a clear warning instead.
-if ! codex-antigravity models list 2>/dev/null | grep -q "^- ${MODEL}:"; then
+catalog="$(codex-antigravity models list)" || { echo "gcodex: cannot read model catalog" >&2; exit 1; }
+models="$(printf '%s\n' "$catalog" | sed -n 's/^- \([^:]*\):.*/\1/p')"
+if ! grep -Fxq -- "$MODEL" <<< "$models"; then
   echo "gcodex: '$MODEL' is not an Antigravity model (would 404). Using gemini-3.8-flash." >&2
-  echo "  Available: $(codex-antigravity models list 2>/dev/null | sed -n 's/^- \([^:]*\):.*/\1/p' | paste -sd' ' -)" >&2
+  echo "  Available: $(paste -sd' ' - <<< "$models")" >&2
   MODEL="gemini-3.8-flash"
+  grep -Fxq -- "$MODEL" <<< "$models" || { echo "gcodex: default model missing; run setup.sh" >&2; exit 1; }
 fi
 
-exec codex --profile "$PROFILE" -c "model=\"$MODEL\"" "${rest[@]}"
+[[ "$MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "gcodex: invalid model id" >&2; exit 2; }
+
+CATALOG_HELPER="$(dirname "$CONFIG")/gcodex-model-catalog.py"
+[[ -r "$CATALOG_HELPER" ]] || { echo "gcodex: missing model catalog helper; run setup.sh" >&2; exit 1; }
+catalog_override="$(python3 "$CATALOG_HELPER" "$PORT" "$(dirname "$CONFIG")/gcodex.models.json")" || exit 1
+
+# ---------------------------------------------------------------------------
+# Trim the per-request prompt.
+#
+# A profile cannot drop what the base config already declares: `codex --profile`
+# layers files, so every skill and every MCP server in ~/.codex/config.toml is
+# still sent on EVERY model call. Measured on this setup, one request carried
+# 81 KB of skill descriptions and 21 KB of MCP tool schemas against 12 KB of
+# actual task and coding tools -- ~87% overhead, re-sent 12-15 times per task.
+#
+# Gemini is billed per request through a subscription with a weekly cap, so that
+# overhead is the difference between finishing a task and exhausting the quota.
+# Both trims are reversible per invocation:
+#
+#   GCODEX_SKILLS=1  keep the full skill catalog
+#   GCODEX_MCP=1     keep the MCP servers declared in the base config
+#
+# Server names are discovered from the config, never hardcoded, so this adapts
+# to whatever the user has installed.
+# ---------------------------------------------------------------------------
+trim=()
+if [[ "${GCODEX_SKILLS:-0}" != "1" ]]; then
+  # Prefer a keep-list if the user maintains one: skills.config is a per-skill
+  # override layered on "everything enabled", not an allowlist, so the helper
+  # names every skill NOT kept. With no keep-list, drop the catalog entirely --
+  # include_instructions=false does that cleanly, whereas skills.enabled=false
+  # is accepted but changes nothing and a squeezed max_context_tokens still
+  # prints "Exceeded skills context budget" on every run.
+  SKILLS_KEEP="$(dirname "$CONFIG")/gcodex.skills"
+  SKILLS_POLICY="$(dirname "$CONFIG")/gcodex-skills-policy.py"
+  skills_override=""
+  if [[ -r "$SKILLS_KEEP" && -r "$SKILLS_POLICY" ]]; then
+    skills_override="$(python3 "$SKILLS_POLICY" "$SKILLS_KEEP" 2>/dev/null || true)"
+  fi
+  if [[ -n "$skills_override" ]]; then
+    trim+=(-c "$skills_override")
+  else
+    trim+=(-c "skills.include_instructions=false")
+  fi
+fi
+if [[ "${GCODEX_MCP:-0}" != "1" ]]; then
+  while IFS= read -r server; do
+    [[ -n "$server" ]] || continue
+    trim+=(-c "mcp_servers.${server}.enabled=false")
+  done < <(python3 - "$HOME/.codex/config.toml" <<'PYEOF'
+import re, sys
+try:
+    text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+except OSError:
+    raise SystemExit(0)
+seen = []
+# Match [mcp_servers.NAME] and [mcp_servers.NAME.anything]; take NAME only.
+for name in re.findall(r'^\[mcp_servers\.([A-Za-z0-9_-]+)', text, re.M):
+    if name not in seen:
+        seen.append(name)
+print('\n'.join(seen))
+PYEOF
+)
+fi
+
+exec codex --profile "$PROFILE" -c "$catalog_override" -c "model=\"$MODEL\"" \
+     "${trim[@]}" "${rest[@]}"

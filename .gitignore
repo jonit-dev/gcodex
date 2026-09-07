@@ -18,3 +18,13 @@ antigravity-accounts.json
 *credentials*
 .env
 .env.*
+
+# Isolated, disposable harness-comparison runs and their private transcripts.
+.benchmarks/
+
+# Python bytecode from the local test and benchmark runs.
+__pycache__/
+*.py[cod]
+
+# Worktrees live inside the repository and are never committed.
+.worktrees/

@@ -13,6 +13,31 @@ model_provider = "antigravity"
 model_reasoning_effort = "medium"
 model_reasoning_summary = "auto"
 
+# Verification guidance, appended to Codex's own developer message rather than
+# replacing its base instructions.
+#
+# Why this exists: in a recorded bug-fix trial the model added a column to a
+# SQLite schema created with CREATE TABLE IF NOT EXISTS, then verified only
+# against databases its new code had just created. Every test passed, and the
+# first pre-existing database failed with "no such column". The rule below is
+# deliberately about persisted formats in general, not about that task: a
+# harness that has to be told the answer to a specific benchmark has not been
+# improved. Cost is roughly 80 tokens per request.
+developer_instructions = """
+Before changing code that already runs, run its existing tests and note what
+passes, so a regression is visible rather than inferred.
+
+When a change alters anything already persisted or already depended on -- a
+database schema, an on-disk or wire format, a serialized value, a public
+signature or return shape -- verify it against data or callers produced by the
+version you are replacing, not only against data your new code creates. A
+fixture built by the new code cannot detect a compatibility break, because it
+never contains the old shape. Construct the old shape explicitly.
+
+Prefer writing the failing check first, then making it pass.
+"""
+
+
 [model_providers.antigravity]
 name = "Google Antigravity"
 base_url = "http://localhost:__PORT__/v1"
@@ -21,8 +46,8 @@ requires_openai_auth = false
 # Conservative on purpose: this is a subscription endpoint reached through an
 # unofficial gateway. Hammering it on errors is the fastest way to look like
 # abuse. Fewer retries, longer idle tolerance.
-request_max_retries = 2
-stream_max_retries = 2
+request_max_retries = 0
+stream_max_retries = 0
 stream_idle_timeout_ms = 300000
 
 # Lean tool surface. Gemini is not post-trained on Codex's tool schemas, and
@@ -30,10 +55,15 @@ stream_idle_timeout_ms = 300000
 # model picks the right tool less reliably as that surface grows. Nothing is
 # lost — plain `codex` keeps everything, and a project's own .mcp.json still
 # loads per project.
+#
+# `goals` stays on: disabling it removes the /goal slash command entirely, and
+# long-running Gemini sessions are exactly where an explicit objective helps.
+# It costs one extra tool (`update_goal`), not the bulk that `apps` and
+# `multi_agent` add.
 [features]
 apps = false
 multi_agent = false
-goals = false
+goals = true
 
 # A [mcp_servers.x] table in a profile REPLACES the base entry rather than
 # merging, so it must re-declare a transport or the config fails to load. This

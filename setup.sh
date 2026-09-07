@@ -15,11 +15,12 @@
 
 set -euo pipefail
 
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+GCODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 BIN_DIR="${GCODEX_BIN_DIR:-$HOME/.local/bin}"
 PROFILE="gcodex"
-CONFIG="$CODEX_HOME/${PROFILE}.config.toml"
-CREDS="$CODEX_HOME/antigravity-credentials.json"
+CONFIG="$GCODEX_HOME/${PROFILE}.config.toml"
+# Upstream stores OAuth data in ~/.codex even with a custom Codex profile home.
+CREDS="$HOME/.codex/antigravity-credentials.json"
 LAUNCHER="$BIN_DIR/gcodex"
 GATEWAY_PORT="${GCODEX_PORT:-51122}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,11 +32,13 @@ die()  { printf '\033[1;31m[gcodex]\033[0m %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------
 uninstall() {
   say "Uninstalling..."
-  rm -f "$LAUNCHER" "$CONFIG"
+  rm -f "$LAUNCHER" "$CONFIG" "$GCODEX_HOME/gcodex-model-catalog.py" \
+        "$GCODEX_HOME/gcodex-skills-policy.py"
   python3 "$HERE/patch-gateway.py" --revert 2>/dev/null || true
   warn "Left in place (delete by hand if you want them gone):"
+  warn "  $GCODEX_HOME/gcodex.skills   (your skill keep-list — hand-curated)"
   warn "  $CREDS            (Google OAuth client — extracted, not yours to keep or share)"
-  warn "  $CODEX_HOME/antigravity-accounts.json  (your login tokens)"
+  warn "  $HOME/.codex/antigravity-accounts.json  (your login tokens)"
   warn "  gateway catalog entries: codex-antigravity models remove gemini-3.8-flash ..."
   say  "Done."
   exit 0
@@ -75,7 +78,7 @@ warn "Re-run ./setup.sh (or python3 patch-gateway.py) after 'uv tool upgrade cod
 say "Extracting the Antigravity OAuth client from your agy binary..."
 
 pick_creds() {
-  python3 - "$AGY_BIN" "$CODEX_HOME" <<'PY'
+  python3 - "$AGY_BIN" "$GCODEX_HOME" <<'PY'
 import re, sys, glob, os
 agy, codex_home = sys.argv[1], sys.argv[2]
 blob = open(agy, "rb").read()
@@ -112,14 +115,13 @@ print(json.dumps({
 PY
 }
 
-mkdir -p "$CODEX_HOME"
-if [[ -f "$CREDS" ]]; then
+mkdir -p "$GCODEX_HOME" "$(dirname "$CREDS")"
+if [[ -e "$CREDS" || -L "$CREDS" ]]; then
+  python3 "$HERE/install-client.py" --check "$CREDS" || die "invalid credentials at $CREDS; move the file aside and rerun setup"
   say "Credentials already present at $CREDS — leaving as-is."
 else
-  umask 077
-  pick_creds > "$CREDS" || die "credential extraction failed"
-  chmod 600 "$CREDS"
-  say "Wrote $CREDS (chmod 600). Client: $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["client_id"])' "$CREDS")"
+  pick_creds | python3 "$HERE/install-client.py" "$CREDS" || die "credential extraction failed"
+  say "Wrote $CREDS (chmod 600)."
 fi
 
 # --------------------------------------------------------------------------
@@ -134,7 +136,32 @@ add_model gemini-3.8-flash-low  gemini-3.8-flash-low    "Gemini 3.8 Flash (Low)"
 # --------------------------------------------------------------------------
 # 4. Install the Codex profile and the launcher.
 say "Installing Codex profile -> $CONFIG"
+cp "$HERE/model-catalog.py" "$GCODEX_HOME/gcodex-model-catalog.py"
+cp "$HERE/skills-policy.py" "$GCODEX_HOME/gcodex-skills-policy.py"
 sed "s|__PORT__|$GATEWAY_PORT|g" "$HERE/templates/gcodex.config.toml" > "$CONFIG"
+
+# Skill keep-list. Codex sends every installed skill's description on every
+# model call; on a per-request subscription quota that is the largest single
+# cost in the request. An empty keep-list means "send none of them", which is
+# the safe default -- the skills stay on disk and can still be used by naming
+# their SKILL.md. Never overwrite a list the user has already curated.
+SKILLS_KEEP="$GCODEX_HOME/gcodex.skills"
+if [[ ! -e "$SKILLS_KEEP" ]]; then
+  say "Seeding empty skill keep-list -> $SKILLS_KEEP"
+  cat > "$SKILLS_KEEP" <<'SKILLS_EOF'
+# gcodex skill keep-list — one skill name per line, '#' starts a comment.
+#
+# Codex ships every installed skill's name and description in the prompt on
+# EVERY model call. Only the skills named here are kept for gcodex; the rest
+# are disabled for gcodex only. Plain `codex` is untouched.
+#
+# Empty file = drop the skill catalog entirely (smallest prompt).
+# GCODEX_SKILLS=1 restores the full catalog for a single run.
+SKILLS_EOF
+  chmod 600 "$SKILLS_KEEP"
+else
+  say "Keeping existing skill keep-list at $SKILLS_KEEP"
+fi
 
 say "Installing launcher -> $LAUNCHER"
 mkdir -p "$BIN_DIR"

@@ -27,6 +27,9 @@ file edits all work with the gateway patch below applied.
 Built on [`codex-antigravity-auth`](https://pypi.org/project/codex-antigravity-auth/).
 Not affiliated with, endorsed by, or supported by Google or OpenAI.
 
+See [real-usage verification](STABILITY.md) for the tested workflows, fixes,
+and remaining limits.
+
 ---
 
 ## Requirements
@@ -75,18 +78,36 @@ This is required for tools to work correctly.
 
 Single-turn prompts work fine; anything agentic dies on the second turn.
 
-`patch-gateway.py` fixes it: it installs a small `thought_signatures.py` cache
+`patch-gateway.py` fixes it: it installs a private `thought_signatures.py` cache
 into the gateway package, records each signature against the `call_id` the
 gateway hands to Codex, and re-attaches it when the request history is rebuilt.
+Signatures survive gateway restarts in `~/.codex/gcodex-signatures/` (directory
+mode 700, SQLite file mode 600). The cache stores call IDs and opaque signatures,
+not prompts or tool output. It retains up to 100,000 signatures for 30 days
+since their last use; memory hits refresh that durable lifetime too.
+Very old sessions or sessions created before this update may need a fresh start.
+
+The patch also translates Codex custom tools such as native `apply_patch` into
+Gemini function calls and translates the resulting stream back. The launcher
+builds a dedicated model catalog from the local gateway so Codex enables these
+tools consistently, without depending on its shared model cache.
 
 ```sh
 python3 patch-gateway.py              # apply (idempotent; setup.sh runs it)
 python3 patch-gateway.py --check      # status
-python3 patch-gateway.py --with-dumps # + dump request/error bodies when GCODEX_DUMP=1
 python3 patch-gateway.py --revert     # restore pristine files
 ```
 
-Restart the gateway afterwards. **`uv tool upgrade codex-antigravity-auth`
+The patch also enforces one stored account, at most one in-flight request per
+gateway process, and a persistent stop after an authentication failure. Busy
+requests wait locally for up to 30 seconds, then receive a clear busy response;
+they do not generate additional Google requests while waiting. Body
+dumps are disabled; applying this version removes the old dump hooks.
+`--check` exits nonzero if any patch is incomplete or legacy dump hooks remain.
+All anchors and Python syntax are validated before writing; write failures
+roll back files already replaced. Stop the gateway before patching so it cannot
+import modules while they are being replaced, then start it afterwards.
+**`uv tool upgrade codex-antigravity-auth`
 overwrites the patch** — re-run the script (or `./setup.sh`) after any upgrade,
 and check whether upstream has fixed it first, in which case the script will
 stop with an "anchor not found" error rather than corrupting anything.
@@ -111,6 +132,17 @@ agy -p "hi"
 ```
 
 If that works, your account is good and any failure is on the gcodex side.
+
+**A failure here does not condemn gcodex.** `agy` reaches Gemini through its own
+OAuth client and is metered separately from the Antigravity IDE client the
+gateway uses, so `agy` can report `Individual quota reached` — its limit resets
+on a multi-day cycle — while gcodex keeps working normally. Observed directly:
+two full gcodex sessions completed between two quota-blocked `agy` runs. Treat
+this check as confirming entitlement, not as a gcodex health check; for that,
+run `gcodex exec "Reply with exactly: ALIVE"`.
+
+`agy` is otherwise only needed at install time, as a *file*: `setup.sh` parses
+the OAuth client out of the binary. gcodex never invokes `agy` at runtime.
 
 ---
 
@@ -142,6 +174,50 @@ launching: if you ask for something Antigravity doesn't serve (e.g.
 
 ---
 
+## Prompt size (why this matters on a subscription)
+
+`codex --profile` *layers* config files, so a profile cannot remove what your
+base `~/.codex/config.toml` declares. Every installed skill and every MCP server
+was therefore shipped on **every model call**. Measured on one request here:
+
+| Part of the request | Bytes | Share |
+| --- | ---: | ---: |
+| Skill catalog (255 entries) | 81,113 | 71% |
+| MCP tool schemas | ~21,000 | 18% |
+| Task, coding tools, everything else | ~12,500 | 11% |
+
+That block is resent 12-15 times per task, against a per-request quota. The
+launcher now trims both, and both are reversible per invocation:
+
+```sh
+gcodex                       # trimmed (default)
+GCODEX_SKILLS=1 gcodex       # keep the full skill catalog for this run
+GCODEX_MCP=1 gcodex          # keep the MCP servers from your base config
+```
+
+**Skills.** Name the ones you want in `~/.codex/gcodex.skills`, one per line.
+Only those are kept for `gcodex`; plain `codex` is untouched. An empty file
+drops the catalog entirely. Skills are still *on disk* either way -- what is
+removed is the model's ability to discover them by itself, so you can always
+point at a `SKILL.md` by path. Measured on this machine:
+
+| Keep-list | Input tokens per request |
+| --- | ---: |
+| All 255 entries (before) | 21,169 |
+| 24 actively-used skills | 6,673 |
+| Empty (catalog dropped) | 2,209 |
+
+`skills.config` is a per-skill override on top of "everything enabled", not an
+allowlist, so `skills-policy.py` names every skill you did *not* keep and
+regenerates that list whenever your installed skills change. Note that
+`skills.enabled=false` is accepted by Codex and does nothing, and shrinking
+`skills.max_context_tokens` prints `Exceeded skills context budget` on each run.
+
+**MCP servers.** Disabled by name, discovered from your config rather than
+hardcoded, so the trim follows whatever you have installed.
+
+---
+
 ## Ban risk
 
 Read this once. The gateway authenticates as the **Antigravity desktop client**
@@ -151,13 +227,25 @@ doing this.
 
 Mitigations baked into gcodex:
 
-- **Single account.** `setup.sh` and the launcher assume one login; never use
-  `codex-antigravity login --count`.
+- **Single account enforced.** The patched gateway refuses to select an account
+  unless exactly one account is stored. It permits one in-flight request per
+  gateway process. Use one gateway process; do not start parallel gateways.
 - **Loopback only.** The gateway binds `127.0.0.1` — nothing is exposed off your
   machine.
-- **Conservative retries.** The profile sets low `request_max_retries` /
-  `stream_max_retries` and a long idle timeout. Hammering the endpoint on errors
-  is the fastest way to look like abuse — don't add retry loops or rotation.
+- **No Codex retries.** The profile sets `request_max_retries` and
+  `stream_max_retries` to zero. The gateway retains upstream rate-limit cooldowns
+  and stops persistently after authentication failures, including 401/403.
+  This stop survives gateway restarts and ordinary cooldown expiry.
+
+After resolving an authentication error, deliberately clear the stop using the
+gateway's Python interpreter (for the default uv installation):
+
+```sh
+~/.local/share/uv/tools/codex-antigravity-auth/bin/python -m codex_antigravity_auth.gateway_safety --clear-auth-stop
+```
+
+This only clears local state; it does not restore revoked access. These controls
+limit accidental traffic and do not make third-party OAuth access sanctioned.
 
 If Google warns you or you see access revoked, **stop.** This is your risk to
 accept.
@@ -174,6 +262,16 @@ out of the repo. Nothing derived from those secrets is ever committed or pushed.
 
 If you clone this repo, you get the wiring — not anyone's keys. You supply your
 own by having `agy` installed.
+
+Credential installation validates JSON and publishes a private file atomically.
+Existing invalid files are rejected with a recovery message. OAuth data stays in
+`~/.codex`, matching the gateway, even when `CODEX_HOME` selects another profile
+directory. Legacy `/tmp/gcodex-req.json` dumps are not deleted by setup; restrict
+their permissions or remove them yourself if you previously enabled dumping.
+
+Run local regression checks with `python3 -B -m unittest discover -s tests -v`.
+When the gateway is installed, the suite also patches an isolated copy and tests
+the real account-selection code without making network requests.
 
 ---
 
@@ -200,9 +298,17 @@ the other family (`884354919052-…`) produces this error.
 
 **`HTTP 400` right after the model's first tool call.**
 The gateway patch isn't applied (or an upgrade wiped it). Run
-`python3 patch-gateway.py --check`, apply it, and restart the gateway. If the
-gateway was restarted mid-conversation, that one conversation can still 400 once
-because the signature cache is in-memory — start a new one.
+`python3 patch-gateway.py --check`, apply it, and restart the gateway. Current
+sessions retain their signatures across restarts. Sessions created before the
+durable-cache update, expired sessions, or a deleted signature database may
+require a new conversation.
+
+**A slash command such as `/goal` is missing under `gcodex`.**
+The profile trims Codex's tool surface, and some slash commands are gated on a
+feature flag rather than on the model. `goals` is enabled; `apps` and
+`multi_agent` are not, so their commands stay hidden here while plain `codex`
+keeps them. Check the `[features]` block in `~/.codex/gcodex.config.toml`, and
+re-run `./setup.sh` if it does not match `templates/gcodex.config.toml`.
 
 **General health check.**
 Run `agy -p "hi"` first. If that returns a Gemini response, your account is

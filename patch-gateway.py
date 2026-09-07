@@ -11,7 +11,6 @@ part when it rebuilds the request history.
 
 Usage:
     python3 patch-gateway.py            # apply (idempotent)
-    python3 patch-gateway.py --with-dumps   # also dump request/400 body when GCODEX_DUMP=1
     python3 patch-gateway.py --revert   # restore the pristine files
     python3 patch-gateway.py --check    # report status only
 """
@@ -19,9 +18,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -132,6 +134,15 @@ from .transform import (
     ),
 ]
 
+LEGACY_TRANSFORM_EDITS = list(TRANSFORM_EDITS)
+LEGACY_TRANSPORT_EDITS = list(TRANSPORT_EDITS)
+TRANSFORM_EDITS = [(old, new.replace("uuid.uuid4().hex[:8]", "uuid.uuid4().hex"))
+                   for old, new in TRANSFORM_EDITS]
+TRANSPORT_EDITS = [(old, new.replace("uuid.uuid4().hex[:8]", "uuid.uuid4().hex")
+                   .replace("uuid.uuid4().hex[:12]", "uuid.uuid4().hex"))
+                   for old, new in TRANSPORT_EDITS]
+
+
 DUMP_EDITS = [
     (
         """        url = f"{self.endpoint}/v1internal:streamGenerateContent?alt=sse"
@@ -174,6 +185,110 @@ DUMP_EDITS = [
     ),
 ]
 
+# These edits replace the earlier optional body dumps. Existing installations
+# are migrated back to the original transport code before applying other edits.
+SAFETY_EDITS = [
+    ("from typing import Any", "from .gateway_safety import account_allowed, stop_after_auth_failure\nfrom typing import Any"),
+    (
+        '            accounts = self.data.get("accounts")\n',
+        '            if not account_allowed(self.data):\n'
+        '                return None\n'
+        '            accounts = self.data.get("accounts")\n',
+    ),
+    (
+        '            email = str(account["email"])\n            if acquire:\n',
+        '            email = str(account["email"])\n'
+        '            if self._in_flight.get(email, 0):\n'
+        '                return None\n'
+        '            if acquire:\n',
+    ),
+    (
+        '        scope = "account" if outcome.scope == "account" else family\n',
+        '        stop_after_auth_failure(self.data, outcome)\n'
+        '        scope = "account" if outcome.scope == "account" else family\n',
+    ),
+]
+
+SERVER_EDITS = [
+    (
+        'account_manager = AccountManager()\n',
+        'account_manager = AccountManager()\n'
+        'from .gateway_safety import RequestLeaseMiddleware, release_tracked_account\n'
+        'app.add_middleware(RequestLeaseMiddleware)\n',
+    ),
+    (
+        '    await run_in_threadpool(account_manager.release_account, email)\n',
+        '    release_tracked_account(account_manager, email)\n',
+    ),
+    (
+        '        "experimental_supported_tools": [],\n',
+        '        "experimental_supported_tools": [],\n'
+        '        "apply_patch_tool_type": "freeform",\n',
+    ),
+    (
+        '        adapter = GoogleStreamEventAdapter(response_id=response_id, display_model=model)\n',
+        '        adapter = GoogleStreamEventAdapter(response_id=response_id, display_model=model)\n'
+        '        from .custom_tools import CustomToolDecoder\n'
+        '        custom_decoder = CustomToolDecoder(codex_req)\n',
+    ),
+    (
+        '            return f"data: {json.dumps(event)}\\n\\n"\n',
+        '            return f"data: {json.dumps(custom_decoder(event))}\\n\\n"\n',
+    ),
+    (
+        '                return codex_resp\n',
+        '                from .custom_tools import CustomToolDecoder\n'
+        '                return CustomToolDecoder(codex_req).response(codex_resp)\n',
+    ),
+    (
+        'async def acquire_active_account_for_request(model: str) -> dict | None:\n'
+        '    return await run_in_threadpool(account_manager.acquire_account, model)\n',
+        'async def acquire_active_account_for_request(model: str) -> dict | None:\n'
+        '    from .gateway_safety import acquire_serially\n'
+        '    return await acquire_serially(account_manager, model, run_in_threadpool)\n',
+    ),
+    (
+        '        finally:\n            cancelled = any(\n',
+        '        finally:\n'
+        '            # Release in-memory leases before cancellable logging awaits.\n'
+        '            for used_account in stream_attempts:\n'
+        '                release_tracked_account(account_manager, used_account.get("email"))\n'
+        '            cancelled = any(\n',
+    ),
+    (
+        '            released_emails = set()\n',
+        '            # Leases were already released synchronously above.\n',
+    ),
+    (
+        '                email = used_account.get("email")\n'
+        '                if email and email not in released_emails:\n'
+        '                    released_emails.add(email)\n'
+        '                    await release_account_for_request(email)\n',
+        '                # No second release: a new request may own this slot.\n',
+    ),
+]
+
+CUSTOM_TRANSFORM_EDITS = [
+    (
+        '    """Translate standard Codex Responses API request body to Antigravity format."""\n',
+        '    """Translate standard Codex Responses API request body to Antigravity format."""\n'
+        '    from .custom_tools import encode_request\n'
+        '    codex_req = encode_request(codex_req)\n',
+    ),
+]
+
+ACCOUNT_EDITS = [
+    (
+        '                self._sync_state_from_storage(data)\n'
+        '                accounts = data.get("accounts", [])\n',
+        '                self._sync_state_from_storage(data)\n'
+        '                from .gateway_safety import account_allowed\n'
+        '                if not account_allowed(data):\n'
+        '                    return False\n'
+        '                accounts = data.get("accounts", [])\n',
+    ),
+]
+
 
 def find_package(explicit: str | None) -> Path:
     if explicit:
@@ -194,29 +309,63 @@ def backup(path: Path) -> None:
         shutil.copy2(path, bak)
 
 
-def apply_edits(path: Path, edits: list[tuple[str, str]], label: str) -> bool:
-    text = path.read_text()
-    changed = False
+def render_edits(text: str, edits: list[tuple[str, str]], label: str) -> str:
     for old, new in edits:
         if new in text:
             continue
         if old not in text:
             sys.exit(
-                f"{label}: anchor not found in {path.name}; upstream changed.\n"
+                f"{label}: anchor not found; upstream changed.\n"
                 f"--- expected ---\n{old}"
             )
+        if text.count(old) != 1:
+            sys.exit(f"{label}: ambiguous anchor; refusing to patch")
         text = text.replace(old, new, 1)
-        changed = True
-    if changed:
-        backup(path)
-        path.write_text(text)
-    return changed
+    return text
+
+
+def atomic_write(path: Path, content: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=".gcodex-patch-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o644)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def commit_files(planned: dict[Path, str]) -> bool:
+    # All anchors and Python syntax are validated before any package mutation.
+    for path, content in planned.items():
+        ast.parse(content, filename=str(path))
+    originals = {p: p.read_bytes() if p.exists() else None for p in planned}
+    changed = [p for p, content in planned.items() if originals[p] != content.encode()]
+    for path in changed:
+        if originals[path] is not None:
+            backup(path)
+    written = []
+    try:
+        for path in changed:
+            atomic_write(path, planned[path].encode())
+            written.append(path)
+    except BaseException:
+        for path in reversed(written):
+            if originals[path] is None:
+                path.unlink()
+            else:
+                atomic_write(path, originals[path])
+        raise
+    return bool(changed)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("package", nargs="?", help="path to the codex_antigravity_auth package")
-    parser.add_argument("--with-dumps", action="store_true", help="also add GCODEX_DUMP debug dumps")
+    parser.add_argument("--with-dumps", action="store_true", help="deprecated; request body dumps are no longer supported")
     parser.add_argument("--revert", action="store_true", help="restore pristine files")
     parser.add_argument("--check", action="store_true", help="report patch status and exit")
     args = parser.parse_args()
@@ -225,38 +374,90 @@ def main() -> None:
     transform = pkg / "transform.py"
     transport = pkg / "google_transport.py"
     module = pkg / "thought_signatures.py"
+    state = pkg / "account_state.py"
+    server = pkg / "server.py"
+    safety = pkg / "gateway_safety.py"
+    custom = pkg / "custom_tools.py"
+    accounts = pkg / "accounts.py"
+
+    if args.with_dumps:
+        parser.error("request body dumps were removed; run without --with-dumps")
 
     if args.check:
-        patched = module.exists() and "thought_signatures" in transform.read_text()
+        patched = (module.exists() and module.read_bytes() == (HERE / module.name).read_bytes()
+                   and all(new in transform.read_text() for _, new in TRANSFORM_EDITS)
+                   and all(new in transport.read_text() for _, new in TRANSPORT_EDITS))
+        guarded = (safety.exists() and safety.read_bytes() == (HERE / safety.name).read_bytes()
+                   and all(new in state.read_text() for _, new in SAFETY_EDITS)
+                   and all(new in server.read_text() for _, new in SERVER_EDITS)
+                   and all(new in accounts.read_text() for _, new in ACCOUNT_EDITS))
+        custom_ready = (custom.exists() and custom.read_bytes() == (HERE / custom.name).read_bytes()
+                        and all(new in transform.read_text() for _, new in CUSTOM_TRANSFORM_EDITS))
         dumps = "GCODEX_DUMP" in transport.read_text()
         print(f"package: {pkg}")
         print(f"thought-signature fix: {'applied' if patched else 'NOT applied'}")
         print(f"debug dumps:           {'applied' if dumps else 'not applied'}")
-        return
+        print(f"account safeguards:    {'applied' if guarded else 'NOT applied'}")
+        print(f"custom tools:          {'applied' if custom_ready else 'NOT applied'}")
+        sys.exit(0 if patched and guarded and custom_ready and not dumps else 1)
 
     if args.revert:
-        restored = []
-        for path in (transform, transport):
+        planned = {}
+        backups = []
+        for path in (transform, transport, state, server, accounts):
             bak = path.with_name(path.name + BACKUP_SUFFIX)
             if bak.exists():
-                shutil.copy2(bak, path)
-                bak.unlink()
-                restored.append(path.name)
-        if module.exists():
-            module.unlink()
-            restored.append(module.name + " (removed)")
+                planned[path] = bak.read_text()
+                backups.append(bak)
+            elif any(marker in path.read_text() for marker in (
+                "from .thought_signatures", "from .gateway_safety", "from .custom_tools",
+                "Release in-memory leases before cancellable logging awaits",
+            )):
+                sys.exit(f"cannot revert {path.name}: backup missing; no files changed")
+        restored_sources = [planned.get(path, path.read_text())
+                            for path in (transform, transport, state, server, accounts)]
+        if any(any(marker in source for marker in ("from .thought_signatures", "from .gateway_safety", "from .custom_tools"))
+               for source in restored_sources):
+            sys.exit("cannot revert: backups still depend on patch helpers; no files changed")
+        commit_files(planned)
+        restored = [path.name for path in planned]
+        for bak in backups:
+            bak.unlink()
+        for helper in (module, safety, custom):
+            if helper.exists():
+                helper.unlink()
+                restored.append(helper.name + " (removed)")
         print("reverted:", ", ".join(restored) if restored else "nothing to revert")
         return
 
-    shutil.copy2(HERE / "thought_signatures.py", module)
-    a = apply_edits(transform, TRANSFORM_EDITS, "transform.py")
-    b = apply_edits(transport, TRANSPORT_EDITS, "google_transport.py")
-    c = apply_edits(transport, DUMP_EDITS, "google_transport.py dumps") if args.with_dumps else False
+    transport_text = transport.read_text()
+    transform_text = transform.read_text()
+    server_text = server.read_text().replace(
+        '                account_manager.release_account(used_account.get("email"))\n',
+        '                release_tracked_account(account_manager, used_account.get("email"))\n',
+    )
+    for old, new in LEGACY_TRANSFORM_EDITS:
+        transform_text = transform_text.replace(new, old)
+    for old, new in LEGACY_TRANSPORT_EDITS:
+        transport_text = transport_text.replace(new, old)
+    for original, dumped in DUMP_EDITS:
+        transport_text = transport_text.replace(dumped, original)
+    if "GCODEX_DUMP" in transport_text:
+        sys.exit("unknown debug dump code; refusing to patch")
+    changed = commit_files({
+        transform: render_edits(transform_text, TRANSFORM_EDITS + CUSTOM_TRANSFORM_EDITS, transform.name),
+        transport: render_edits(transport_text, TRANSPORT_EDITS, transport.name),
+        state: render_edits(state.read_text(), SAFETY_EDITS, state.name),
+        server: render_edits(server_text, SERVER_EDITS, server.name),
+        accounts: render_edits(accounts.read_text(), ACCOUNT_EDITS, accounts.name),
+        module: (HERE / module.name).read_text(),
+        safety: (HERE / safety.name).read_text(),
+        custom: (HERE / custom.name).read_text(),
+    })
 
     print(f"package: {pkg}")
-    print("thought-signature fix:", "applied" if (a or b) else "already applied")
-    if args.with_dumps:
-        print("debug dumps:", "applied" if c else "already applied")
+    print("gateway patches:", "applied" if changed else "already applied")
+    print("debug dumps: disabled; account safeguards: applied")
     print("restart the gateway for changes to take effect")
 
 
