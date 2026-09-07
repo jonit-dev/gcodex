@@ -8,6 +8,23 @@ import tempfile
 import urllib.request
 
 
+# Model ids whose backend accepts image input.
+#
+# Codex reads `input_modalities` to decide whether an attached image is sent at
+# all. The gateway's built-in Gemini and Claude entries declare `["text",
+# "image"]`, but an entry registered with `codex-antigravity models add` -- which
+# is how gcodex installs gemini-3.8-flash -- gets `["text"]`, because that
+# command has no modality flag. The result is that `-i shot.png` and a pasted
+# screenshot are both accepted by the CLI and then silently dropped before the
+# request is built; the model answers as if nothing was attached. Verified
+# against the running gateway: the same image posted straight to /v1/responses
+# is described correctly, so only the catalog was wrong.
+#
+# Prefixes are matched so this repairs that omission and nothing else -- the
+# gpt-oss and ollama entries keep whatever the gateway gave them.
+VISION_PREFIXES = ('gemini-', 'claude-')
+
+
 def build_catalog(payload):
     models = copy.deepcopy(payload.get('models'))
     if not isinstance(models, list) or not models:
@@ -22,6 +39,13 @@ def build_catalog(payload):
             'instructions_template': model.get('base_instructions', ''),
             'instructions_variables': None,
         }
+        if model['slug'].startswith(VISION_PREFIXES):
+            modalities = model.get('input_modalities')
+            if not isinstance(modalities, list) or not modalities:
+                modalities = ['text']
+            if 'image' not in modalities:
+                modalities = list(modalities) + ['image']
+            model['input_modalities'] = modalities
     return {'models': models}
 
 

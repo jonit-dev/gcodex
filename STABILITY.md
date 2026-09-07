@@ -10,7 +10,7 @@ Gemini 3.8 Flash medium/high/low catalog entries.
 | Effort selection | Low and high each ran the fixture tests successfully; medium handled the edit/resume workflows. |
 | Concurrent clients | Two clients started simultaneously and both returned their expected markers. Local tests verify waiting, timeout, and cancellation without releasing another request's slot. |
 | HTTP disconnect recovery | A localhost FastAPI/uvicorn fixture using the actual lease middleware completed 20 stream-disconnect/follow-up cycles and eight concurrent follow-ups: 48 acquisitions, 48 releases, zero slots left occupied, peak occupancy one. It uses a fake account manager and makes no Google requests. |
-| Local regressions | 93 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
+| Local regressions | 126 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
 
 ## Fixes made during iteration
 
@@ -116,6 +116,35 @@ skill's SKILL.md arrives in the request as a `<skill>` block with its path,
 confirmed by dumping the request body at a stub provider. A separate dump
 confirms the injected block carries both the profile's own verification guidance
 and the keep-list entries.
+
+Three CLI incompatibilities were fixed after watching real gcodex dispatches
+fail before a single token was spent.
+
+`gcodex exec -i shot.png "prompt"` used to die on `Reading prompt from
+stdin... No prompt provided via stdin`: `codex`'s `--image` is declared
+variadic, so clap consumed the prompt as a second filename. Rewriting it to
+`--image=shot.png` binds one value per flag and the prompt survives.
+
+Even then the model answered `NO_IMAGE`. Codex decides whether to attach an
+image from the catalog's `input_modalities`, and `codex-antigravity models add`
+has no modality flag, so all three gemini-3.8-flash entries gcodex registers
+were text-only while the gateway's own built-in Gemini entries were not. Posting
+the same PNG straight to the gateway's `/v1/responses` returned the correct
+answer, which located the fault in the catalog rather than the transform. The
+catalog gcodex builds now declares image input for `gemini-` and `claude-`
+entries; `gpt-oss` and `ollama` entries are untouched. Verified live: the same
+`-i` invocation now reads the image, in 5,681 tokens and with no tool calls.
+
+`gcodex review --uncommitted "custom instructions"` was rejected outright by
+clap. Neither half could simply be dropped — a bare `codex review "prompt"`
+turns out to receive no diff at all, confirmed by asking a review what changed
+and getting `NONE` — so the selector stays on the command line and the
+instructions are appended to `developer_instructions`, on top of the skill
+keep-list override rather than in place of it. A broken or missing shim
+forwards the command line untouched; both paths are covered by tests.
+
+`gcodex --help`, `--version` and `completion` no longer start the gateway,
+which had made them fail on a machine that has not logged in yet.
 
 ## Practical limits
 

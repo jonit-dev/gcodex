@@ -174,6 +174,43 @@ launching: if you ask for something Antigravity doesn't serve (e.g.
 `gpt-5.6-luna`), it prints the available models and falls back to
 `gemini-3.8-flash` rather than letting Google 404 mid-stream.
 
+`gcodex --help`, `--version` and `completion` answer without starting the
+gateway, so they work before you have logged in.
+
+### Images
+
+```sh
+gcodex exec -i screenshot.png "what is wrong with this layout?"
+```
+
+Attaching an image works, and pasting one into the TUI works. Two things had to
+be fixed for that, both of which look like the model ignoring the image:
+
+- Codex only sends an attachment when the model catalog says the model accepts
+  one, and `codex-antigravity models add` has no modality flag, so every entry
+  gcodex registers came back text-only. The catalog gcodex hands to Codex now
+  declares `image` input for the Gemini and Claude entries. `gpt-oss` and
+  `ollama` entries are left exactly as the gateway reported them.
+- `codex`'s own `--image` is variadic (`<FILE>...`), so `-i shot.png "prompt"`
+  hands the prompt to clap as a second filename and the run dies with
+  `No prompt provided via stdin`. gcodex rewrites those to `--image=shot.png`,
+  which binds one value and leaves the prompt alone.
+
+### `codex review` with your own instructions
+
+```sh
+gcodex review --uncommitted "only flag coverage-integrity defects"
+```
+
+Plain `codex` rejects this — `the argument '--uncommitted' cannot be used with
+'[PROMPT]'` — and the two halves are not interchangeable: a bare
+`codex review "prompt"` is handed **no diff at all**. gcodex keeps both. The
+selector stays on the command line so the review still sees the right changes,
+and your instructions are appended to the profile's `developer_instructions`,
+alongside the skill keep-list rather than replacing it. The same applies to
+`--base <branch>` and `--commit <sha>`. A one-line note on stderr says it
+happened.
+
 ---
 
 ## Prompt size (why this matters on a subscription)

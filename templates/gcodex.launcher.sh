@@ -52,6 +52,21 @@ while (( $# )); do
   shift
 done
 
+# Help, version and shell completion describe the CLI rather than talk to a
+# model. Starting the gateway for them means `gcodex --help` fails on a machine
+# that has not logged in yet, which is exactly the machine reading the help.
+describes_cli=0
+[[ "${rest[0]:-}" == "completion" ]] && describes_cli=1
+for argument in "${rest[@]+"${rest[@]}"}"; do
+  case "$argument" in
+    --) break ;;
+    -h|--help|-V|--version) describes_cli=1; break ;;
+  esac
+done
+if (( describes_cli )); then
+  exec codex --profile "$PROFILE" "${rest[@]+"${rest[@]}"}"
+fi
+
 if [[ ! -r "$CREDS" && -z "${ANTIGRAVITY_CLIENT_ID:-}" ]]; then
   echo "gcodex: no OAuth client credentials. Run setup.sh, then: codex-antigravity login" >&2
   exit 1
@@ -147,6 +162,38 @@ for name in re.findall(r'^\[mcp_servers\.([A-Za-z0-9_-]+)', text, re.M):
 print('\n'.join(seen))
 PYEOF
 )
+fi
+
+# ---------------------------------------------------------------------------
+# Recover the two command lines the installed Codex CLI rejects for reasons
+# that have nothing to do with which model is behind the harness:
+#
+#   gcodex exec -i shot.png 'what is this'
+#       --image is variadic, so clap swallows the prompt as another filename
+#       and the run dies on "No prompt provided via stdin".
+#
+#   gcodex review --uncommitted 'review only the coverage change'
+#       codex refuses the scope selector together with a prompt, and the two
+#       are not interchangeable: a bare `review PROMPT` is handed no diff at
+#       all, so neither half can simply be dropped.
+#
+# The helper rewrites both, printing NUL-separated fields -- an optional -c
+# override first, then the arguments -- and exits non-zero when the line needs
+# no rewriting, in which case it is forwarded exactly as typed.
+# ---------------------------------------------------------------------------
+COMPAT="$(dirname "$CONFIG")/gcodex-cli-compat.py"
+if [[ -r "$COMPAT" ]]; then
+  compat=()
+  while IFS= read -r -d '' field; do
+    compat+=("$field")
+  done < <(python3 "$COMPAT" --config "$CONFIG" --instructions "${skills_override:-}" \
+             -- "${rest[@]+"${rest[@]}"}" || true)
+  if (( ${#compat[@]} )); then
+    if [[ -n "${compat[0]}" ]]; then
+      trim+=(-c "${compat[0]}")
+    fi
+    rest=("${compat[@]:1}")
+  fi
 fi
 
 exec codex --profile "$PROFILE" -c "$catalog_override" -c "model=\"$MODEL\"" \

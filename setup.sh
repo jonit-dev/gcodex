@@ -33,7 +33,8 @@ die()  { printf '\033[1;31m[gcodex]\033[0m %s\n' "$*" >&2; exit 1; }
 uninstall() {
   say "Uninstalling..."
   rm -f "$LAUNCHER" "$CONFIG" "$GCODEX_HOME/gcodex-model-catalog.py" \
-        "$GCODEX_HOME/gcodex-skills-policy.py"
+        "$GCODEX_HOME/gcodex-skills-policy.py" \
+        "$GCODEX_HOME/gcodex-cli-compat.py"
   python3 "$HERE/patch-gateway.py" --revert 2>/dev/null || true
   warn "Left in place (delete by hand if you want them gone):"
   warn "  $GCODEX_HOME/gcodex.skills   (your skill keep-list — hand-curated)"
@@ -138,6 +139,7 @@ add_model gemini-3.8-flash-low  gemini-3.8-flash-low    "Gemini 3.8 Flash (Low)"
 say "Installing Codex profile -> $CONFIG"
 cp "$HERE/model-catalog.py" "$GCODEX_HOME/gcodex-model-catalog.py"
 cp "$HERE/skills-policy.py" "$GCODEX_HOME/gcodex-skills-policy.py"
+cp "$HERE/cli-compat.py" "$GCODEX_HOME/gcodex-cli-compat.py"
 sed "s|__PORT__|$GATEWAY_PORT|g" "$HERE/templates/gcodex.config.toml" > "$CONFIG"
 
 # Skill keep-list. Codex sends every installed skill's description on every
