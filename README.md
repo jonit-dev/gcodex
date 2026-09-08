@@ -263,6 +263,15 @@ hardcoded, so the trim follows whatever you have installed.
 
 ## Rate limits (429)
 
+Google also uses HTTP 429 for **exhausted quota**. When its error identifies
+`QUOTA_EXHAUSTED` or "Individual quota reached", gcodex stops automatic retries
+and reports **Google quota exhausted**, with the reset date and time in the
+gateway's local timezone (including its UTC offset). The reset comes from
+Google's `quotaResetTimeStamp`, falling back to `quotaResetDelay` or `RetryInfo`;
+no reset date is hardcoded. If Google provides no usable reset, the message says
+so. Known reset times are persisted per account/model family, so later requests
+fail immediately until the reset instead of retrying every five minutes.
+
 A rate limit is a wait, not a verdict. Codex is configured with zero retries
 here on purpose, so an unhandled 429 ends the turn and you retype the prompt.
 The patched gateway instead **waits out the limit and picks the turn back up

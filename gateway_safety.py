@@ -10,6 +10,100 @@ QUEUE_TIMEOUT_SECONDS = 30
 STATE_POLL_SECONDS = 1.0
 _REQUEST_LEASES = ContextVar('gcodex_request_leases', default=None)
 _WAIT_NOTICES = ContextVar('gcodex_wait_notices', default=None)
+QUOTA_KEY = 'gcodexQuotaExhausted'
+
+
+def quota_details(payload, now):
+    """Extract explicit quota exhaustion; a generic 429 remains a rate limit."""
+    import math
+    from datetime import datetime
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None
+    details = error.get('details', [])
+    details = details if isinstance(details, list) else []
+    exhausted = 'individual quota reached' in str(error.get('message', '')).lower()
+    timestamp = None
+    delays = []
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        exhausted |= detail.get('reason') == 'QUOTA_EXHAUSTED'
+        metadata = detail.get('metadata')
+        if isinstance(metadata, dict):
+            try:
+                parsed = datetime.fromisoformat(metadata['quotaResetTimeStamp'].replace('Z', '+00:00'))
+                if parsed.tzinfo is not None:
+                    timestamp = parsed.timestamp()
+            except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+                pass
+            delays.append(metadata.get('quotaResetDelay'))
+        if detail.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
+            delays.append(detail.get('retryDelay'))
+    if not exhausted:
+        return None
+    if timestamp is None:
+        import re
+        for value in delays:
+            if not isinstance(value, str):
+                continue
+            match = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s', value)
+            if match:
+                hours, minutes, seconds = match.groups()
+                delay = int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds)
+                if math.isfinite(delay) and delay > 0:
+                    timestamp = now + delay
+                    break
+    try:
+        if timestamp is not None:
+            datetime.fromtimestamp(timestamp)
+    except (ValueError, OverflowError, OSError):
+        timestamp = None
+    return {'resetAt': timestamp}
+
+
+def quota_message(quota):
+    from datetime import datetime
+    reset = quota.get('resetAt')
+    if reset is None:
+        return 'Google quota exhausted. Google did not provide a reset time. Automatic retries stopped.'
+    local = datetime.fromtimestamp(reset).astimezone()
+    return (f'Google quota exhausted. Quota resets on {local:%B %d, %Y at %H:%M:%S %Z} '
+            f'(UTC{local:%z}). Automatic retries stopped until then.')
+
+
+async def capture_quota(response, email, model, run_in_threadpool):
+    """Keep only reset metadata, never Google's body or account credentials."""
+    import time
+    from .storage import update_accounts
+    if response.status_code != 429:
+        return None
+    try:
+        quota = quota_details(response.json(), time.time())
+    except (ValueError, TypeError):
+        return None
+    if quota is None:
+        return None
+    if quota['resetAt'] is not None:
+        def save(data):
+            data.setdefault(QUOTA_KEY, {}).setdefault(email, {})[model_family(model)] = quota
+        await run_in_threadpool(update_accounts, save)
+    message = quota_message(quota)
+    log_pause(message)
+    return message
+
+
+def active_quota(data, model, now):
+    records = data.get(QUOTA_KEY, {})
+    if not isinstance(records, dict):
+        return None
+    for account in data.get('accounts', []):
+        scopes = records.get(account.get('email'), {})
+        quota = scopes.get(model_family(model)) if isinstance(scopes, dict) else None
+        if isinstance(quota, dict) and isinstance(quota.get('resetAt'), (int, float)):
+            if quota['resetAt'] > now:
+                return quota
+    return None
 
 
 def enable_wait_notices(stream):
@@ -354,6 +448,8 @@ async def rate_limit_pause_seconds(model, run_in_threadpool, budget):
     data = await run_in_threadpool(load_accounts_read_only)
     if not account_allowed(data):
         return None
+    if active_quota(data, model, time.time()):
+        return None
     remaining = cooldown_remaining(data, model, time.time())
     if remaining <= 0:
         remaining = RATE_LIMIT_FALLBACK_PAUSE_SECONDS
@@ -377,6 +473,12 @@ async def acquire_serially(manager, model, run_in_threadpool):
     next_state_read = None
     wait_budget = ACQUIRE_WAIT_SECONDS
     while True:
+        data = await run_in_threadpool(load_accounts_read_only)
+        quota = active_quota(data, model, time.time())
+        if quota:
+            import math
+            raise HTTPException(429, quota_message(quota), headers={
+                'Retry-After': str(max(1, math.ceil(quota['resetAt'] - time.time())))})
         account = await run_in_threadpool(acquire_and_track)
         if account is not None:
             return account

@@ -291,7 +291,7 @@ class InstalledGatewayIntegration(unittest.TestCase):
                           and n.name == 'sse_generator')
             self.assertNotIn(waiting[0], range(stream.lineno, stream.end_lineno + 1))
 
-    def run_patched_stream(self, pkg, *, failures, visible_output):
+    def run_patched_stream(self, pkg, *, failures, visible_output, quota=False):
         """Drive the patched sse_generator with a stubbed Google transport.
 
         `failures` is how many leading attempts raise HTTP 429 before one
@@ -323,8 +323,11 @@ class InstalledGatewayIntegration(unittest.TestCase):
 
         class HTTPError(Exception):
             status_code = 429
-            response = None
+            response = types.SimpleNamespace(text='quota') if quota else None
             outcome = types.SimpleNamespace(scope='family', category='rate_limit')
+
+        async def capture_quota(*args):
+            return 'Google quota exhausted. Quota resets on February 17, 2031 at 15:16:53 PST.' if quota else None
 
         class Adapter:
             visible_output_started = visible_output
@@ -355,6 +358,7 @@ class InstalledGatewayIntegration(unittest.TestCase):
             'stream_fixture.gateway_safety': types.SimpleNamespace(
                 COOLDOWN_WAIT_SECONDS=900, log_pause=lambda message: None,
                 rate_limit_pause_seconds=pause,
+                capture_quota=capture_quota,
                 refresh_lease_token=refresh_lease_token,
                 notify_wait=SAFETY['notify_wait'],
                 keepalive_sleep=SAFETY['keepalive_sleep']),
@@ -391,6 +395,18 @@ class InstalledGatewayIntegration(unittest.TestCase):
     @staticmethod
     async def noop(*args, **kwargs):
         return None
+
+    def test_quota_stream_reports_reset_without_retrying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                           check=True, capture_output=True)
+            run = self.run_patched_stream(pkg, failures=1, visible_output=False, quota=True)
+            self.assertEqual(len(run.attempts), 1)
+            self.assertEqual(run.sleeps, [])
+            self.assertEqual(run.recorded, ['quota'])
+            self.assertEqual(run.failed[0][0], 'quota')
+            self.assertIn('February 17, 2031', run.failed[0][1])
 
     @staticmethod
     async def none(*args, **kwargs):

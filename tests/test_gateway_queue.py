@@ -149,8 +149,10 @@ class QueueTests(QueueFixture):
         self.manager.acquire_account = lambda model: {'email': 'test'}
         self.manager.release_account = released.append
         async def cancelled_delivery(fn, *args):
-            fn(*args)
-            raise asyncio.CancelledError()
+            result = fn(*args)
+            if fn.__name__ == 'acquire_and_track':
+                raise asyncio.CancelledError()
+            return result
         async def app(scope, receive, send):
             await self.safety['acquire_serially'](self.manager, 'gemini', cancelled_delivery)
         middleware = self.safety['RequestLeaseMiddleware'](app)

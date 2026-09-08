@@ -136,6 +136,13 @@ from .transform import (
 
 LEGACY_TRANSFORM_EDITS = list(TRANSFORM_EDITS)
 LEGACY_TRANSPORT_EDITS = list(TRANSPORT_EDITS)
+TRANSPORT_EDITS += [(
+    '                yield response\n',
+    '                # Read structured quota details before the HTTP stream closes.\n'
+    '                if response.status_code == 429:\n'
+    '                    await response.aread()\n'
+    '                yield response\n',
+)]
 TRANSFORM_EDITS = [(old, new.replace("uuid.uuid4().hex[:8]", "uuid.uuid4().hex"))
                    for old, new in TRANSFORM_EDITS]
 TRANSPORT_EDITS = [(old, new.replace("uuid.uuid4().hex[:8]", "uuid.uuid4().hex")
@@ -218,6 +225,28 @@ SAFETY_EDITS = [
 ]
 
 SERVER_EDITS = [
+    (
+        '            except GoogleHTTPError as exc:\n',
+        '            except GoogleHTTPError as exc:\n'
+        '                from .gateway_safety import capture_quota\n'
+        '                quota_detail = (await capture_quota(exc.response, stream_account.get("email", ""),\n'
+        '                                                    model, run_in_threadpool)\n'
+        '                                if exc.response is not None else None)\n'
+        '                if quota_detail:\n'
+        '                    exc.outcome = AttemptOutcome(scope="none", category="quota")\n',
+    ),
+    (
+        '                    error_message = f"Google Antigravity returned HTTP {exc.status_code}."\n',
+        '                    error_message = quota_detail or f"Google Antigravity returned HTTP {exc.status_code}."\n',
+    ),
+    (
+        '            if res.status_code in (401, 403, 429):\n',
+        '            from .gateway_safety import capture_quota\n'
+        '            quota_detail = await capture_quota(res, response_account.get("email", ""), model, run_in_threadpool)\n'
+        '            if quota_detail:\n'
+        '                raise HTTPException(429, quota_detail)\n'
+        '            if res.status_code in (401, 403, 429):\n',
+    ),
     (
         '    stream = response_stream_flag(codex_req)\n',
         '    stream = response_stream_flag(codex_req)\n'
