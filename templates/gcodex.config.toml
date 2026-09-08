@@ -49,12 +49,13 @@ requires_openai_auth = false
 request_max_retries = 0
 stream_max_retries = 0
 # The gateway answers a rate limit by waiting out the recorded cooldown (120s
-# doubling to 1920s upstream, capped by GCODEX_COOLDOWN_WAIT, 900s by default)
-# and then sending exactly one request, so a 429 pauses the turn instead of
-# ending it. That pause is silence on an open stream, which is what this
-# timeout measures: it has to outlast the longest wait the gateway will take.
-# Verified against a stub provider: Codex 0.153.4 accepts a 900s silence
-# before the first event and still renders the answer.
+# doubling, capped at GCODEX_MAX_PAUSE, 300s by default) and then sending
+# exactly one request, so a 429 pauses the turn instead of ending it. Once the
+# stream has started that pause is covered by keepalive events, but a request
+# still waiting for a free slot has sent no headers and cannot emit anything:
+# that wait is plain silence, which is what this timeout measures. Verified
+# against a stub provider: Codex 0.153.4 accepts a 900s silence before the
+# first event and still renders the answer.
 stream_idle_timeout_ms = 1200000
 
 # Lean tool surface. Gemini is not post-trained on Codex's tool schemas, and

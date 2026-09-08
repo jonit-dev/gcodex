@@ -10,7 +10,7 @@ Gemini 3.8 Flash medium/high/low catalog entries.
 | Effort selection | Low and high each ran the fixture tests successfully; medium handled the edit/resume workflows. |
 | Concurrent clients | Two clients started simultaneously and both returned their expected markers. Local tests verify waiting, timeout, and cancellation without releasing another request's slot. |
 | HTTP disconnect recovery | A localhost FastAPI/uvicorn fixture using the actual lease middleware completed 20 stream-disconnect/follow-up cycles and eight concurrent follow-ups: 48 acquisitions, 48 releases, zero slots left occupied, peak occupancy one. It uses a fake account manager and makes no Google requests. |
-| Local regressions | 126 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
+| Local regressions | 139 tests passed, including an isolated install/reapply/revert/reinstall cycle against the installed gateway's original source files, warm-cache expiry/restart consistency, and checks that all three comparison graders reject broken starters. |
 
 ## Fixes made during iteration
 
@@ -81,9 +81,8 @@ now wait the recorded cooldown out and then send exactly one request: the
 pre-request wait happens before anything is sent, and the mid-stream retry runs
 only while `visible_output_started` is false, on the slot the request already
 owns, so no output is ever duplicated and the account is never asked twice at
-once. Each request carries a wait budget (`GCODEX_COOLDOWN_WAIT`, default 900s);
-a cooldown longer than what is left of it is still reported as a 429 with
-`Retry-After`.
+once. Each request carries a wait budget; a cooldown longer than what is left of it
+is still reported as a 429 with `Retry-After`.
 
 Evidence: a 45-second cooldown was written into the real account store and
 `gcodex exec` then answered in 44 seconds, with
@@ -102,6 +101,63 @@ before the response headers and for 180s after them, and then for the full 900s
 budget after them: all three completed and rendered the answer, exit 0 (903s
 wall clock for the last). The profile's `stream_idle_timeout_ms` is now 20
 minutes so the longest permitted wait fits inside it.
+
+The wait then became one a turn can actually survive: capped backoff plus
+keepalives. Two limits made the pause weaker than it looks. Upstream's ladder
+doubles to 1920s, which is longer than the wait budget, so a turn that hit its
+third consecutive limit died at exactly the point the backoff was supposed to
+carry it; and the whole wait had to fit inside the client's idle timeout,
+because a waiting stream sent nothing. The ladder's guessed tail is now capped
+at `GCODEX_MAX_PAUSE` (300s; a stated `Retry-After` is still obeyed in full),
+and the wait is sliced by keepalive events, so the total budget
+(`GCODEX_COOLDOWN_WAIT`) rises to an hour per turn while the pre-stream wait
+keeps the verified 900s ceiling (`GCODEX_ACQUIRE_WAIT`) — that one is still
+plain silence, since no headers have been sent.
+
+Which keepalive works was measured, not assumed. Against a stub provider that
+held its answer for 30s under an 8-second `stream_idle_timeout_ms`, Codex
+0.153.4 dropped the stream with `idle timeout waiting for SSE` when the filler
+was SSE comment lines every 2s — the timer is measured between parsed events,
+and a comment is not one. The same run with an unknown event type
+(`{"type": "response.gcodex_keepalive"}`) survived all 30s, rendered the
+answer, and left nothing in the transcript, including when the keepalives
+preceded `response.created`. Twelve regression tests cover the capped ladder
+(applied through the real patched `_apply_cooldown`), the slicing, and the
+patched `sse_generator` emitting exactly one beat per idle window; one more
+patches an install carrying the previous release's edits and asserts the
+result is byte-identical to patching a pristine one, since an edit whose text
+changed is otherwise invisible to the "already applied" check.
+
+The retry loop then had to be made honest about what it was doing. Two defects
+only showed up once real traffic hit the pause path, both found in the request
+log rather than by reading the code.
+
+*The backoff was not backing off.* Upstream records one outcome per account per
+request — correct for rotation, where every attempt is a different account, and
+wrong for a retry against the same one: `record_stream_attempt` dropped every
+attempt after the first. No fresh cooldown was written, so the next pause read
+an expired one, fell through to `GCODEX_RATE_LIMIT_PAUSE`, and the turn asked
+Google again on a flat 61s beat until its hour ran out. The evidence was a
+59-to-1 split: 23 of 29 recorded pauses used the fallback interval, and 55 rate
+limits reached the client against 4 written to `antigravity-requests.jsonl`.
+The retry now clears its own dedupe entry, so each attempt writes a cooldown,
+the ladder climbs 120s → 240s → 300s as designed, and a success at the end
+clears the failure count the limits built up.
+
+*The token expired mid-wait.* A request carries the account dict that was live
+when it acquired; every later state write rebuilds the store from disk into new
+dicts, so `refresh_expiring_accounts` can never reach a turn already running.
+`account_lease` re-read `accessToken` from that stale snapshot on every retry,
+and acquire only guarantees 300s of remaining life. One 401 exists in the whole
+request history and it is the tell: `latency_ms` 640631, ten minutes and forty
+seconds after that turn started. Every request that answered quickly was a 200,
+400 or 429. A 401 is scored `scope="account"`, so it does not merely end the
+turn — it trips the persistent auth stop. `refresh_lease_token` now re-points
+the snapshot at stored state before each retry and forces a refresh first if
+the stored token has less than `GCODEX_TOKEN_MARGIN` (300s) left. Seven unit
+tests cover it, and the patched-`sse_generator` fixture asserts each attempt
+carries a distinct token and that all four outcomes of a three-limit turn reach
+account state.
 
 Skill tagging survives the prompt trim. The trim used to disable every skill
 outside `~/.codex/gcodex.skills` with `skills.config`, which also removed them

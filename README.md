@@ -265,27 +265,55 @@ hardcoded, so the trim follows whatever you have installed.
 
 A rate limit is a wait, not a verdict. Codex is configured with zero retries
 here on purpose, so an unhandled 429 ends the turn and you retype the prompt.
-The patched gateway instead **pauses and sends one request when the cooldown
-expires**:
+The patched gateway instead **waits out the limit and picks the turn back up
+by itself** — capped exponential backoff, one request per interval:
 
-- Upstream records a cooldown on a 429 — 120s, doubling per consecutive
-  failure, capped at 1920s (or Google's `Retry-After`, whichever is longer).
+- Upstream records a cooldown on a 429: 120s, doubling per consecutive failure.
+  The patch caps that ladder at `GCODEX_MAX_PAUSE` (default 300s) instead of
+  upstream's 1920s, because the tail of the ladder is a *guess* — nobody told
+  us to wait that long. Google's own `Retry-After` is never shortened.
 - If the limit lands before any output has reached you, the gateway holds the
-  open stream, sleeps that long, and retries on the slot it already owns. One
-  request goes out, when the cooldown says it may. Nothing is sent while
-  waiting, and the account is never asked twice at once.
+  open stream, sleeps the cooldown out, and retries on the slot it already
+  owns. One request goes out, when the cooldown says it may. Nothing is sent
+  while waiting, and the account is never asked twice at once.
+- Each retry that also gets limited waits the next rung, so a turn rides out a
+  string of limits: 120s, 240s, then 300s a rung until the budget is spent.
+  Every attempt is recorded, not just the first: upstream keeps one outcome
+  per account per request, which is right when each attempt is a *different*
+  account and wrong for a retry, where it meant no new cooldown was written,
+  the next pause read a stale one, and the ladder never climbed off its
+  fallback interval.
+- Each retry is sent with a token that is still valid. The account a request
+  holds is a snapshot taken when it acquired, and the background refresher
+  writes to a different copy, so a turn that pauses would otherwise keep
+  presenting the token it captured — good for as little as 300s — and collect
+  an HTTP 401 that counts against the *account*, not just the turn.
 - Once tokens have already been streamed, a retry would duplicate them, so the
   failure is reported as before.
 - A request that arrives while a cooldown is still live waits it out the same
   way before anything is sent.
 
-Each request has a wait budget, `GCODEX_COOLDOWN_WAIT` (default 900s, read by
-the gateway process at start). A cooldown longer than the remaining budget —
-the deep end of the backoff, or a quota that resets on a multi-day cycle — is
-reported as a 429 with `Retry-After` rather than held open. The profile's
-`stream_idle_timeout_ms` is set to 20 minutes to cover the pause; Codex 0.153.4
-was verified against a stub provider to accept 900s of silence before the first
-event and still render the answer.
+**Keeping the stream alive.** Codex drops a stream that goes quiet for
+`stream_idle_timeout_ms`, and it measures that between SSE *events*: verified
+against Codex 0.153.4, keepalive comment lines every 2s still tripped an 8s
+idle timeout, while an event type it does not recognise reset the timer, was
+discarded, and left the answer intact. So the gateway emits one such event
+(`response.gcodex_keepalive`) every `GCODEX_KEEPALIVE` seconds (default 60)
+while it waits. Nothing of it reaches the transcript; it exists so a long wait
+is not mistaken for a dead connection.
+
+Three knobs bound the wait, all read by the gateway process at start:
+
+| Variable | Default | Covers |
+| --- | --- | --- |
+| `GCODEX_MAX_PAUSE` | 300s | Longest single wait we impose ourselves. `0` restores upstream's uncapped ladder. |
+| `GCODEX_COOLDOWN_WAIT` | 3600s | Total wait per turn, across every limit that turn hits. Keepalives hold the stream, so this is not bounded by the idle timeout. |
+| `GCODEX_ACQUIRE_WAIT` | 900s | Wait before a stream has started. No headers have been sent yet, so this one is plain silence — Codex 0.153.4 was verified against a stub provider to accept 900s of it and still render the answer. |
+| `GCODEX_TOKEN_MARGIN` | 300s | Token life a retry insists on. Below it the gateway refreshes before sending; upstream uses the same figure when handing out an account. |
+
+A wait that cannot fit its budget — a `Retry-After` measured in hours, or a
+turn that has already spent its hour — is reported as a 429 with `Retry-After`
+rather than held open, and the turn ends the old way.
 
 The pause is visible in the gateway log
 (`~/.codex/antigravity-gateway-<port>.log`):
@@ -294,8 +322,10 @@ The pause is visible in the gateway log
 [*] gcodex: rate limited; waiting 121s before retrying this turn
 ```
 
-Codex itself shows nothing during the wait, so a turn that seems to hang is
-worth checking against that log before assuming it died.
+Codex itself shows nothing during the wait — it sits on `Working...` — so a
+turn that seems to hang is worth checking against that log before assuming it
+died. A turn can legitimately spend `GCODEX_COOLDOWN_WAIT` there; lower it if
+you would rather be told sooner.
 
 ---
 
@@ -319,7 +349,9 @@ Mitigations baked into gcodex:
   This stop survives gateway restarts and ordinary cooldown expiry.
 - **Rate limits pause instead of retrying.** A 429 makes the gateway wait out
   the recorded cooldown and then send *one* request, rather than the client
-  retrying (see below). The wait is local: nothing reaches Google during it.
+  retrying (see below). The wait is local: nothing reaches Google during it,
+  and capping the backoff shortens the wait, never the number of requests —
+  one per interval, at most twelve in the hour a turn may wait.
 
 After resolving an authentication error, deliberately clear the stop using the
 gateway's Python interpreter (for the default uv installation):
@@ -394,11 +426,21 @@ feature flag rather than on the model. `goals` is enabled; `apps` and
 keeps them. Check the `[features]` block in `~/.codex/gcodex.config.toml`, and
 re-run `./setup.sh` if it does not match `templates/gcodex.config.toml`.
 
+**`HTTP 401` on a turn that had been waiting a while.**
+Fixed as of the token re-point described under [Rate limits](#rate-limits-429):
+a paused turn now refreshes before each retry instead of presenting the token
+it captured when it started. If you see one on an older build, the account is
+not necessarily in trouble — check whether the turn had been waiting longer
+than the token had left. Clear the auth stop it sets with the
+`--clear-auth-stop` command above once the account itself is healthy.
+
 **A turn sits there for minutes with no output.**
 Most likely the gateway is waiting out a rate-limit cooldown, which is the
-intended behaviour. `tail -f ~/.codex/antigravity-gateway-51122.log` and look
-for `gcodex: rate limited; waiting`. Set `GCODEX_COOLDOWN_WAIT=0` before
-starting the gateway if you would rather have the 429 back immediately.
+intended behaviour — it retries by itself, up to an hour per turn by default.
+`tail -f ~/.codex/antigravity-gateway-51122.log` and look for
+`gcodex: rate limited; waiting`. Set `GCODEX_COOLDOWN_WAIT=0` before starting
+the gateway if you would rather have the 429 back immediately, or lower it to
+bound how long a turn may hang.
 
 **General health check.**
 Run `agy -p "hi"` first. If that returns a Gemini response, your account is

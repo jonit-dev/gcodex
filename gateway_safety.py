@@ -31,10 +31,128 @@ def _seconds_from_env(name, default):
 # extra: the pause is local and exactly one request is sent when the cooldown
 # expires. A mid-stream retry keeps the slot it already holds; a request still
 # waiting to start holds none.
-COOLDOWN_WAIT_SECONDS = _seconds_from_env("GCODEX_COOLDOWN_WAIT", 900.0)
+#
+# Total wait per turn, across as many limits as one turn hits. The stream is
+# held open by keepalives while this runs, so it is not bounded by the
+# client's idle timeout the way the pre-stream wait below is.
+COOLDOWN_WAIT_SECONDS = _seconds_from_env("GCODEX_COOLDOWN_WAIT", 3600.0)
+# A request that has not started streaming has sent no headers, so nothing can
+# be emitted to keep the client interested: this wait is plain silence, and
+# only 900s of it is verified against Codex 0.153.4.
+ACQUIRE_WAIT_SECONDS = _seconds_from_env("GCODEX_ACQUIRE_WAIT", 900.0)
 # Used when a rate limit arrives without a recorded cooldown to read, so the
 # retry still backs off instead of answering Google immediately.
 RATE_LIMIT_FALLBACK_PAUSE_SECONDS = _seconds_from_env("GCODEX_RATE_LIMIT_PAUSE", 60.0)
+# Backoff has to be exponential to be polite and capped to stay usable. The
+# upstream ladder is 120s doubling per consecutive failure to 1920s, and a
+# 1920s wait ends the turn anyway: it outlives both the request's wait budget
+# and the client's tolerance for silence. Cap the ladder instead, so the turn
+# keeps retrying on an interval that fits. Zero or less disables the cap.
+MAX_PAUSE_SECONDS = _seconds_from_env("GCODEX_MAX_PAUSE", 300.0)
+# Codex measures stream_idle_timeout between SSE *events*. A comment line
+# resets nothing -- verified against 0.153.4: keepalive comments every 2s
+# still tripped an 8s idle timeout -- while an event type it does not know
+# resets the timer and is dropped without reaching the transcript. That is
+# what lets a pause outlive the client's idle timeout instead of being
+# capped by it. Emitted only while waiting, never as part of an answer.
+KEEPALIVE_EVENT = 'data: {"type": "response.gcodex_keepalive"}\n\n'
+KEEPALIVE_SECONDS = _seconds_from_env("GCODEX_KEEPALIVE", 60.0)
+# How much life a token must have left to be worth sending. Acquire uses the
+# same 300s, so this is upstream's own threshold applied a second time, at the
+# point where it actually matters: just before a retry, rather than only at the
+# start of a turn that may pause for far longer than the token lives.
+TOKEN_MARGIN_SECONDS = _seconds_from_env("GCODEX_TOKEN_MARGIN", 300.0)
+# Copied onto the in-flight snapshot; everything else about the account is
+# either unchanged by a refresh or none of a lease's business.
+LEASE_FIELDS = ("accessToken", "expiresAt", "projectId", "managedProjectId")
+
+
+async def keepalive_sleep(seconds):
+    """Sleep, yielding a keepalive event often enough to hold the stream open.
+
+    Yields raw SSE text, not adapter events: the client must ignore these, and
+    the response protocol has no event for "still waiting". Nothing is yielded
+    after the last slice -- the retry follows immediately.
+    """
+    import asyncio
+    remaining = float(seconds)
+    while remaining > 0:
+        step = KEEPALIVE_SECONDS if 0 < KEEPALIVE_SECONDS < remaining else remaining
+        await asyncio.sleep(step)
+        remaining -= step
+        if remaining > 0:
+            yield KEEPALIVE_EVENT
+
+
+def cooldown_duration(backoff, retry_after_seconds):
+    """Seconds of cooldown to record for a failed attempt.
+
+    Mirrors upstream's `max(backoff, retry_after)` but clamps the guessed half
+    of it. A backend that sent no `Retry-After` never told us to wait 1920s --
+    we inferred that from a doubling counter, and re-checking sooner costs one
+    request. A stated `Retry-After` is the backend's own instruction and is
+    never shortened, only bounded by upstream's 24h ceiling.
+    """
+    try:
+        retry_after = min(float(retry_after_seconds or 0), 86_400.0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    backoff = float(backoff)
+    if MAX_PAUSE_SECONDS > 0:
+        backoff = min(backoff, MAX_PAUSE_SECONDS)
+    return max(backoff, retry_after)
+
+
+def stored_account(data, email):
+    for stored in data.get("accounts") or []:
+        if isinstance(stored, dict) and stored.get("email") == email:
+            return stored
+    return None
+
+
+def token_expiry(stored):
+    """Seconds-since-epoch expiry, tolerating the milliseconds upstream also writes."""
+    try:
+        value = float(stored.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value / 1000 if value > 10_000_000_000 else value
+
+
+async def refresh_lease_token(manager, account, run_in_threadpool):
+    """Re-point an in-flight account snapshot at a token that is still valid.
+
+    A request carries the account dict that was live when it acquired: every
+    later state write rebuilds the store from disk into fresh dicts, so the
+    background refresher can never reach a turn that is already running, and
+    the lease keeps sending the token captured at acquire time. Acquire only
+    guarantees 300s of remaining life while a paused turn routinely outlives
+    that, which is where a mid-turn 401 comes from -- and a 401 is scored as
+    an account failure, so it stops the gateway rather than just this turn.
+
+    Refresh is attempted only when the stored token is itself close to
+    expiring, which is when upstream's own refresher would act too: this adds
+    no new class of token request, only the copy back onto the snapshot.
+    """
+    import time
+    from .storage import load_accounts_read_only
+
+    email = account.get("email") if isinstance(account, dict) else None
+    if not email:
+        return
+    data = await run_in_threadpool(load_accounts_read_only)
+    stored = stored_account(data, email)
+    if stored is not None and token_expiry(stored) <= time.time() + TOKEN_MARGIN_SECONDS:
+        # Refreshing writes through storage, so re-read instead of trusting
+        # the copy already in hand.
+        await run_in_threadpool(manager.refresh_expiring_accounts, int(TOKEN_MARGIN_SECONDS))
+        data = await run_in_threadpool(load_accounts_read_only)
+        stored = stored_account(data, email) or stored
+    if stored is None:
+        return
+    for field in LEASE_FIELDS:
+        if stored.get(field):
+            account[field] = stored[field]
 
 
 @dataclass
@@ -182,7 +300,7 @@ async def acquire_serially(manager, model, run_in_threadpool):
     def acquire_and_track():
         return _track(leases, manager, manager.acquire_account(model))
     next_state_read = None
-    wait_budget = COOLDOWN_WAIT_SECONDS
+    wait_budget = ACQUIRE_WAIT_SECONDS
     while True:
         account = await run_in_threadpool(acquire_and_track)
         if account is not None:
@@ -208,7 +326,8 @@ async def acquire_serially(manager, model, run_in_threadpool):
                     raise HTTPException(
                         429,
                         f"gcodex: account is cooling down for {int(remaining) + 1}s, longer than the "
-                        f"{int(COOLDOWN_WAIT_SECONDS)}s this gateway waits; no request sent to Google",
+                        f"{int(ACQUIRE_WAIT_SECONDS)}s this gateway waits before a stream starts; "
+                        "no request sent to Google",
                         headers={"Retry-After": str(max(1, int(remaining) + 1))})
                 log_pause("waiting out a %ds cooldown before sending anything to Google" % (int(remaining) + 1))
                 wait_budget -= remaining

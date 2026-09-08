@@ -202,6 +202,69 @@ class InstalledGatewayIntegration(unittest.TestCase):
             shutil.copy2(original if original.exists() else source, pkg / source.name)
         return pkg
 
+    def test_patched_cooldown_ladder_is_capped(self):
+        # Executes the real patched _apply_cooldown: the ladder must still
+        # double per consecutive failure, stop at the cap, and hand a stated
+        # Retry-After straight through.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            result = subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            tree = ast.parse((pkg / 'account_state.py').read_text())
+            node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                        and n.name == '_apply_cooldown')
+            namespace = dict(__package__='state_fixture',
+                             stop_after_auth_failure=SAFETY['stop_after_auth_failure'])
+            with patch.dict(__import__('sys').modules, {
+                'state_fixture.gateway_safety': types.SimpleNamespace(
+                    cooldown_duration=SAFETY['cooldown_duration'])
+            }):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), 'account_state.py', 'exec'),
+                     namespace)
+                apply_cooldown = namespace['_apply_cooldown']
+                manager = types.SimpleNamespace(
+                    data={}, _now=lambda: 0.0,
+                    state={'failures': {}, 'cooldowns': {}})
+                outcome = types.SimpleNamespace(
+                    scope='family', category='rate_limit', retry_after_seconds=None)
+                ladder = [apply_cooldown(manager, 'test', 'gemini', outcome) for _ in range(5)]
+                self.assertEqual(ladder, [120, 240, SAFETY['MAX_PAUSE_SECONDS'],
+                                          SAFETY['MAX_PAUSE_SECONDS'],
+                                          SAFETY['MAX_PAUSE_SECONDS']])
+                self.assertEqual(manager.state['cooldowns']['test']['gemini'],
+                                 SAFETY['MAX_PAUSE_SECONDS'])
+                outcome.retry_after_seconds = 3600
+                self.assertEqual(apply_cooldown(manager, 'test', 'gemini', outcome), 3600)
+
+    def test_upgrade_over_an_older_patch_does_not_stack_edits(self):
+        # An edit whose replacement text changes is not recognised as applied,
+        # so re-patching would insert a second copy of it. The result of
+        # patching a package that still carries the previous gcodex patch must
+        # be identical to patching a pristine one.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            server = pkg / 'server.py'
+            subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                           check=True, capture_output=True)
+            current = server.read_text()
+            # Each entry is one edit as some earlier release wrote it. Roll
+            # them back one at a time from the patched copy: an install
+            # carries a single shape per anchor, so reverting several at once
+            # would describe a version that never shipped.
+            self.assertTrue(PATCH['LEGACY_SERVER_EDITS'])
+            for anchor, superseded in PATCH['LEGACY_SERVER_EDITS']:
+                replacement = next(new for old, new in PATCH['SERVER_EDITS'] if old == anchor)
+                self.assertIn(replacement, current)
+                older = current.replace(replacement, superseded, 1)
+                self.assertNotEqual(older, current)
+                server.write_text(older)
+                result = subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(server.read_text(), current)
+            self.assertEqual(current.count('rate_limit_pause_seconds(model'), 1)
+
     def test_rotation_cannot_raise_out_of_a_started_response(self):
         # A rotation acquire runs while the request still holds the single
         # slot, so a waiting acquire always times out; raising there kills an
@@ -231,14 +294,32 @@ class InstalledGatewayIntegration(unittest.TestCase):
     def run_patched_stream(self, pkg, *, failures, visible_output):
         """Drive the patched sse_generator with a stubbed Google transport.
 
-        Returns (chunks, attempts, sleeps). `failures` is how many leading
-        attempts raise HTTP 429 before one succeeds.
+        `failures` is how many leading attempts raise HTTP 429 before one
+        succeeds. The returned namespace carries what the stubs observed:
+        `chunks`, `attempts` (one lease snapshot each), `sleeps`, `failed`,
+        `recorded` (the outcome categories that reached account state) and
+        `refreshes` (one per token re-point before a retry).
         """
         tree = ast.parse((pkg / 'server.py').read_text())
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
                     and n.name == 'sse_generator')
         completed = {'type': 'response.completed', 'response': {'id': 'r', 'usage': {}}}
-        attempts, sleeps, failed_events = [], [], []
+        attempts, sleeps, failed_events, refreshes = [], [], [], []
+        # Upstream's own per-request dedupe, reproduced exactly: it is the
+        # thing the retry path has to defeat, so stubbing it away would hide
+        # the bug rather than test the fix.
+        recorded_emails, recorded = set(), []
+
+        async def record_stream_attempt(selected_account, outcome, **kwargs):
+            email = selected_account.get('email', '')
+            if email in recorded_emails:
+                return
+            recorded_emails.add(email)
+            recorded.append(outcome.category)
+
+        async def refresh_lease_token(manager, account, pool):
+            refreshes.append(account.get('accessToken'))
+            account['accessToken'] = 'fresh-%d' % len(refreshes)
 
         class HTTPError(Exception):
             status_code = 429
@@ -263,29 +344,36 @@ class InstalledGatewayIntegration(unittest.TestCase):
         async def sleep(seconds):
             sleeps.append(seconds)
 
+        # Three keepalive slices: long enough to prove the wait is broken up
+        # and that the client hears something between the pieces.
         async def pause(model, pool, budget):
-            return 0.5 if budget > 0 else None
+            return 3 * SAFETY['KEEPALIVE_SECONDS'] if budget > 0 else None
 
         modules = {
             'stream_fixture.custom_tools': types.SimpleNamespace(
                 CustomToolDecoder=lambda codex_req: (lambda event: event)),
             'stream_fixture.gateway_safety': types.SimpleNamespace(
                 COOLDOWN_WAIT_SECONDS=900, log_pause=lambda message: None,
-                rate_limit_pause_seconds=pause),
+                rate_limit_pause_seconds=pause,
+                refresh_lease_token=refresh_lease_token,
+                keepalive_sleep=SAFETY['keepalive_sleep']),
         }
         namespace = dict(
             __package__='stream_fixture', AsyncGenerator=__import__('typing').AsyncGenerator,
             json=json, model='gemini-3.8-flash', family='gemini', codex_req={},
-            stream_attempts=[{'email': 'test'}], attempt_num=0,
+            stream_attempts=[{'email': 'test', 'accessToken': 'stale'}], attempt_num=0,
+            recorded_stream_attempts=recorded_emails, account_manager=object(),
             GoogleStreamEventAdapter=lambda **kwargs: Adapter(),
             GoogleHTTPError=HTTPError, GoogleStreamPayloadError=type('Payload', (Exception,), {}),
             AttemptOutcome=lambda **kwargs: types.SimpleNamespace(**kwargs),
             google_transport=types.SimpleNamespace(stream_events=stream_events),
-            account_lease=lambda account: account,
+            # Snapshot per attempt: the real lease copies the token out of
+            # the account dict, so sharing one object would hide a re-point.
+            account_lease=lambda account: dict(account),
             is_validation_required_error=lambda status, text: False,
             retry_after_seconds_from_response=lambda response: None,
             run_in_threadpool=None,
-            record_stream_attempt=self.noop, log_request=self.noop,
+            record_stream_attempt=record_stream_attempt, log_request=self.noop,
             rotate_active_account_for_request=self.none,
             release_account_for_request=self.noop,
         )
@@ -295,7 +383,9 @@ class InstalledGatewayIntegration(unittest.TestCase):
                 with patch('asyncio.sleep', sleep):
                     return [chunk async for chunk in namespace['sse_generator']()]
             chunks = asyncio.run(drain())
-        return chunks, attempts, sleeps, failed_events
+        return types.SimpleNamespace(chunks=chunks, attempts=attempts, sleeps=sleeps,
+                                     failed=failed_events, recorded=recorded,
+                                     refreshes=refreshes)
 
     @staticmethod
     async def noop(*args, **kwargs):
@@ -315,12 +405,52 @@ class InstalledGatewayIntegration(unittest.TestCase):
             result = subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            chunks, attempts, sleeps, failed = self.run_patched_stream(
-                pkg, failures=1, visible_output=False)
-            self.assertEqual(len(attempts), 2)
-            self.assertEqual(sleeps, [0.5])
-            self.assertEqual(failed, [])
-            self.assertIn('response.completed', ''.join(chunks))
+            run = self.run_patched_stream(pkg, failures=1, visible_output=False)
+            self.assertEqual(len(run.attempts), 2)
+            keepalive = SAFETY['KEEPALIVE_SECONDS']
+            self.assertEqual(run.sleeps, [keepalive] * 3)
+            self.assertEqual(run.failed, [])
+            body = ''.join(run.chunks)
+            self.assertIn('response.completed', body)
+            # Two beats for three slices: the client hears from the gateway
+            # inside every idle window, and the retry follows the last slice
+            # with no filler of its own.
+            self.assertEqual(body.count(SAFETY['KEEPALIVE_EVENT']), 2)
+            self.assertLess(body.index(SAFETY['KEEPALIVE_EVENT']),
+                            body.index('response.completed'))
+
+    def test_every_retry_reaches_account_state(self):
+        # Upstream records one outcome per account per request, which is right
+        # for rotation -- each attempt is a different account -- and wrong for
+        # a retry, where every attempt after the first was silently dropped.
+        # Nothing then wrote a fresh cooldown, so the next pause read a stale
+        # one, fell back to a flat interval and the ladder never climbed: the
+        # turn kept asking Google on a fixed beat until its budget ran out.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                           check=True, capture_output=True)
+            run = self.run_patched_stream(pkg, failures=3, visible_output=False)
+            self.assertEqual(len(run.attempts), 4)
+            # One record per attempt, in order, and the success at the end is
+            # what clears the failure ladder the three limits just built.
+            self.assertEqual(run.recorded, ['rate_limit'] * 3 + ['success'])
+
+    def test_each_retry_sends_a_re_pointed_token(self):
+        # The account dict handed to a request is a snapshot: every later
+        # state write rebuilds the store into fresh dicts, so the background
+        # refresher cannot reach a turn already in flight. Acquire only
+        # guarantees 300s of token life and a paused turn outlives that, so
+        # without a re-point the retry ships an expired token and earns a 401
+        # -- which is scored against the account, not just the turn.
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self.pristine_copy(tmp)
+            subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)],
+                           check=True, capture_output=True)
+            run = self.run_patched_stream(pkg, failures=2, visible_output=False)
+            self.assertEqual(run.refreshes, ['stale', 'fresh-1'])
+            self.assertEqual([lease['accessToken'] for lease in run.attempts],
+                             ['stale', 'fresh-1', 'fresh-2'])
 
     def test_rate_limit_after_visible_output_is_not_retried(self):
         # Once tokens have shipped, a second attempt would repeat them, so the
@@ -329,11 +459,11 @@ class InstalledGatewayIntegration(unittest.TestCase):
             pkg = self.pristine_copy(tmp)
             subprocess.run(['python3', str(ROOT / 'patch-gateway.py'), str(pkg)], check=True,
                            capture_output=True)
-            chunks, attempts, sleeps, failed = self.run_patched_stream(
-                pkg, failures=1, visible_output=True)
-            self.assertEqual(len(attempts), 1)
-            self.assertEqual(sleeps, [])
-            self.assertEqual([code for code, _ in failed], ['rate_limit'])
+            run = self.run_patched_stream(pkg, failures=1, visible_output=True)
+            self.assertEqual(len(run.attempts), 1)
+            self.assertEqual(run.sleeps, [])
+            self.assertEqual(run.refreshes, [])
+            self.assertEqual([code for code, _ in run.failed], ['rate_limit'])
 
     def test_patch_upgrade_idempotence_and_real_account_state(self):
         try:

@@ -207,6 +207,14 @@ SAFETY_EDITS = [
         '        stop_after_auth_failure(self.data, outcome)\n'
         '        scope = "account" if outcome.scope == "account" else family\n',
     ),
+    (
+        '        duration = max(backoff, min(float(retry_after), 86_400))\n',
+        '        # Cap the guessed half of the ladder: an uncapped 1920s cooldown\n'
+        '        # outlives the wait budget, so the turn dies where a shorter\n'
+        '        # interval would have retried. A stated Retry-After still wins.\n'
+        '        from .gateway_safety import cooldown_duration\n'
+        '        duration = cooldown_duration(backoff, retry_after)\n',
+    ),
 ]
 
 SERVER_EDITS = [
@@ -308,7 +316,8 @@ SERVER_EDITS = [
         '        attempt_num = 0\n',
         '        custom_decoder = CustomToolDecoder(codex_req)\n'
         '        import asyncio\n'
-        '        from .gateway_safety import COOLDOWN_WAIT_SECONDS, log_pause, rate_limit_pause_seconds\n'
+        '        from .gateway_safety import (COOLDOWN_WAIT_SECONDS, keepalive_sleep, log_pause,\n'
+        '                                     rate_limit_pause_seconds, refresh_lease_token)\n'
         '        rate_limit_budget = COOLDOWN_WAIT_SECONDS\n'
         '        attempt_num = 0\n',
     ),
@@ -338,11 +347,100 @@ SERVER_EDITS = [
         '                if pause is not None:\n'
         '                    rate_limit_budget -= pause\n'
         '                    log_pause("rate limited; waiting %ds before retrying this turn" % (int(pause) + 1))\n'
+        '                    # Keepalives, not silence: an idle stream is\n'
+        '                    # dropped by the client, and a dropped stream is\n'
+        '                    # the turn dying of the limit we are waiting out.\n'
+        '                    async for beat in keepalive_sleep(pause):\n'
+        '                        yield beat\n'
+        '                    # Upstream records one outcome per account per\n'
+        '                    # request. That is right for rotation and wrong\n'
+        '                    # for a retry: every attempt after the first is\n'
+        '                    # dropped, so no fresh cooldown is written, the\n'
+        '                    # next pause reads a stale one and falls back to\n'
+        '                    # a flat interval, and the ladder never climbs.\n'
+        '                    recorded_stream_attempts.discard(stream_account.get("email", ""))\n'
+        '                    # The account dict is a snapshot taken at acquire\n'
+        '                    # time and the background refresher writes to a\n'
+        '                    # different copy, so a paused turn would go on\n'
+        '                    # sending a token that expired while it waited.\n'
+        '                    await refresh_lease_token(account_manager, stream_account, run_in_threadpool)\n'
+        '                    adapter.reset_attempt()\n'
+        '                    continue\n'
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+    ),
+]
+
+# Undoing an older gcodex patch before re-applying the current one: an edit
+# whose replacement text changed would otherwise be inserted a second time,
+# since only its own output marks it as already applied.
+LEGACY_SERVER_EDITS = [
+    (
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+        '            # A rate limit is a wait, not a verdict: pause the turn here\n'
+        '            # rather than failing it, since the profile allows the client\n'
+        '            # no retries of its own. Nothing is sent to Google while we\n'
+        '            # sleep, and the retry reuses the slot this request already\n'
+        '            # holds, so the account is never asked twice at once. Only\n'
+        '            # before any visible output -- once tokens have shipped, a\n'
+        '            # second attempt would duplicate them.\n'
+        '            if (outcome is not None and outcome.category == "rate_limit"\n'
+        '                    and not adapter.visible_output_started):\n'
+        '                pause = await rate_limit_pause_seconds(model, run_in_threadpool, rate_limit_budget)\n'
+        '                if pause is not None:\n'
+        '                    rate_limit_budget -= pause\n'
+        '                    log_pause("rate limited; waiting %ds before retrying this turn" % (int(pause) + 1))\n'
+        '                    # Keepalives, not silence: an idle stream is\n'
+        '                    # dropped by the client, and a dropped stream is\n'
+        '                    # the turn dying of the limit we are waiting out.\n'
+        '                    async for beat in keepalive_sleep(pause):\n'
+        '                        yield beat\n'
+        '                    adapter.reset_attempt()\n'
+        '                    continue\n'
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+    ),
+    (
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        attempt_num = 0\n',
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        import asyncio\n'
+        '        from .gateway_safety import (COOLDOWN_WAIT_SECONDS, keepalive_sleep, log_pause,\n'
+        '                                     rate_limit_pause_seconds)\n'
+        '        rate_limit_budget = COOLDOWN_WAIT_SECONDS\n'
+        '        attempt_num = 0\n',
+    ),
+    (
+        '            if attempt_num == 0 and not adapter.visible_output_started:\n'
+        '                rotated = await rotate_active_account_for_request(model)\n',
+        '            # A rate limit is a wait, not a verdict: pause the turn here\n'
+        '            # rather than failing it, since the profile allows the client\n'
+        '            # no retries of its own. Nothing is sent to Google while we\n'
+        '            # sleep, and the retry reuses the slot this request already\n'
+        '            # holds, so the account is never asked twice at once. Only\n'
+        '            # before any visible output -- once tokens have shipped, a\n'
+        '            # second attempt would duplicate them.\n'
+        '            if (outcome is not None and outcome.category == "rate_limit"\n'
+        '                    and not adapter.visible_output_started):\n'
+        '                pause = await rate_limit_pause_seconds(model, run_in_threadpool, rate_limit_budget)\n'
+        '                if pause is not None:\n'
+        '                    rate_limit_budget -= pause\n'
+        '                    log_pause("rate limited; waiting %ds before retrying this turn" % (int(pause) + 1))\n'
         '                    await asyncio.sleep(pause)\n'
         '                    adapter.reset_attempt()\n'
         '                    continue\n'
         '            if attempt_num == 0 and not adapter.visible_output_started:\n'
         '                rotated = await rotate_active_account_for_request(model)\n',
+    ),
+    (
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        attempt_num = 0\n',
+        '        custom_decoder = CustomToolDecoder(codex_req)\n'
+        '        import asyncio\n'
+        '        from .gateway_safety import COOLDOWN_WAIT_SECONDS, log_pause, rate_limit_pause_seconds\n'
+        '        rate_limit_budget = COOLDOWN_WAIT_SECONDS\n'
+        '        attempt_num = 0\n',
     ),
 ]
 
@@ -514,6 +612,8 @@ def main() -> None:
         '                account_manager.release_account(used_account.get("email"))\n',
         '                release_tracked_account(account_manager, used_account.get("email"))\n',
     )
+    for old, new in LEGACY_SERVER_EDITS:
+        server_text = server_text.replace(new, old)
     for old, new in LEGACY_TRANSFORM_EDITS:
         transform_text = transform_text.replace(new, old)
     for old, new in LEGACY_TRANSPORT_EDITS:
