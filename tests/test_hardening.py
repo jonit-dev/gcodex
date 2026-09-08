@@ -356,6 +356,7 @@ class InstalledGatewayIntegration(unittest.TestCase):
                 COOLDOWN_WAIT_SECONDS=900, log_pause=lambda message: None,
                 rate_limit_pause_seconds=pause,
                 refresh_lease_token=refresh_lease_token,
+                notify_wait=SAFETY['notify_wait'],
                 keepalive_sleep=SAFETY['keepalive_sleep']),
         }
         namespace = dict(

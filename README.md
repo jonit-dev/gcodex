@@ -322,9 +322,11 @@ The pause is visible in the gateway log
 [*] gcodex: rate limited; waiting 121s before retrying this turn
 ```
 
-Codex itself shows nothing during the wait — it sits on `Working...` — so a
-turn that seems to hang is worth checking against that log before assuming it
-died. A turn can legitimately spend `GCODEX_COOLDOWN_WAIT` there; lower it if
+Codex displays a commentary message when each cooldown starts:
+`Rate limited. Please wait 300 seconds; gcodex will retry automatically.`
+This covers both a cooldown already in progress and a limit encountered during
+the turn. The duration is the next retry delay, not a guarantee that quota will
+be available then. A turn can spend `GCODEX_COOLDOWN_WAIT` waiting; lower it if
 you would rather be told sooner.
 
 ---
@@ -437,6 +439,8 @@ than the token had left. Clear the auth stop it sets with the
 **A turn sits there for minutes with no output.**
 Most likely the gateway is waiting out a rate-limit cooldown, which is the
 intended behaviour — it retries by itself, up to an hour per turn by default.
+Each cooldown should display a `Rate limited. Please wait ...` message. If it
+does not, apply the current gateway patch and restart the gateway.
 `tail -f ~/.codex/antigravity-gateway-51122.log` and look for
 `gcodex: rate limited; waiting`. Set `GCODEX_COOLDOWN_WAIT=0` before starting
 the gateway if you would rather have the 429 back immediately, or lower it to

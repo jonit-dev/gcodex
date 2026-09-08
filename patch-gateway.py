@@ -219,6 +219,12 @@ SAFETY_EDITS = [
 
 SERVER_EDITS = [
     (
+        '    stream = response_stream_flag(codex_req)\n',
+        '    stream = response_stream_flag(codex_req)\n'
+        '    from .gateway_safety import enable_wait_notices\n'
+        '    enable_wait_notices(stream)\n',
+    ),
+    (
         'account_manager = AccountManager()\n',
         'account_manager = AccountManager()\n'
         'from .gateway_safety import RequestLeaseMiddleware, release_tracked_account\n'
@@ -371,10 +377,20 @@ SERVER_EDITS = [
     ),
 ]
 
+# Keep the previous retry block available for upgrades from installed patches.
+PRE_NOTICE_RETRY_EDIT = SERVER_EDITS[-1]
+SERVER_EDITS[-1] = (PRE_NOTICE_RETRY_EDIT[0], PRE_NOTICE_RETRY_EDIT[1].replace(
+    '                    async for beat in keepalive_sleep(pause):\n',
+    '                    from .gateway_safety import notify_wait\n'
+    '                    await notify_wait(pause)\n'
+    '                    async for beat in keepalive_sleep(pause):\n',
+))
+
 # Undoing an older gcodex patch before re-applying the current one: an edit
 # whose replacement text changed would otherwise be inserted a second time,
 # since only its own output marks it as already applied.
 LEGACY_SERVER_EDITS = [
+    PRE_NOTICE_RETRY_EDIT,
     (
         '            if attempt_num == 0 and not adapter.visible_output_started:\n'
         '                rotated = await rotate_active_account_for_request(model)\n',
@@ -612,6 +628,7 @@ def main() -> None:
         '                account_manager.release_account(used_account.get("email"))\n',
         '                release_tracked_account(account_manager, used_account.get("email"))\n',
     )
+    server_text = server_text.replace(SERVER_EDITS[-1][1], SERVER_EDITS[-1][0])
     for old, new in LEGACY_SERVER_EDITS:
         server_text = server_text.replace(new, old)
     for old, new in LEGACY_TRANSFORM_EDITS:

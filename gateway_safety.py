@@ -9,6 +9,39 @@ QUEUE_TIMEOUT_SECONDS = 30
 # A waiter re-reads persisted account state at most this often while queueing.
 STATE_POLL_SECONDS = 1.0
 _REQUEST_LEASES = ContextVar('gcodex_request_leases', default=None)
+_WAIT_NOTICES = ContextVar('gcodex_wait_notices', default=None)
+
+
+def enable_wait_notices(stream):
+    state = _WAIT_NOTICES.get()
+    if state is not None:
+        state['enabled'] = bool(stream)
+
+
+def wait_notice_events(seconds):
+    """A completed commentary item, separate from the model's answer."""
+    import json
+    import math
+    import uuid
+    item_id = 'msg_gcodex_wait_' + uuid.uuid4().hex
+    message = (f'Rate limited. Please wait {math.ceil(seconds)} seconds; '
+               'gcodex will retry automatically.')
+    item = dict(id=item_id, type='message', role='assistant', phase='commentary',
+                status='in_progress', content=[])
+    events = [dict(type='response.output_item.added', output_index=0, item=item.copy()),
+              dict(type='response.content_part.added', item_id=item_id, output_index=0,
+                   content_index=0, part=dict(type='output_text', text='', annotations=[])),
+              dict(type='response.output_text.delta', item_id=item_id, output_index=0,
+                   content_index=0, delta=message)]
+    item.update(status='completed', content=[dict(type='output_text', text=message, annotations=[])])
+    events.append(dict(type='response.output_item.done', output_index=0, item=item))
+    return ''.join('data: ' + json.dumps(event) + '\n\n' for event in events).encode()
+
+
+async def notify_wait(seconds):
+    state = _WAIT_NOTICES.get()
+    if state is not None and state['enabled']:
+        await state['notify'](seconds)
 
 
 def _seconds_from_env(name, default):
@@ -177,12 +210,54 @@ class RequestLeaseMiddleware:
             return await self.app(scope, receive, send)
         leases = []
         token = _REQUEST_LEASES.set(leases)
+        started = False
+        early = False
+        error_status = None
+        error_body = bytearray()
+
+        async def notify(seconds):
+            nonlocal started, early
+            if not started:
+                await send({'type': 'http.response.start', 'status': 200,
+                            'headers': [(b'content-type', b'text/event-stream'),
+                                        (b'cache-control', b'no-cache')]})
+                started = early = True
+            await send({'type': 'http.response.body', 'body': wait_notice_events(seconds),
+                        'more_body': True})
+
+        async def forward(message):
+            nonlocal started, error_status
+            if message['type'] == 'http.response.start':
+                if early:
+                    if message['status'] >= 400:
+                        error_status = message['status']
+                    return
+                started = True
+            if message['type'] == 'http.response.body' and error_status is not None:
+                # Headers already went out with the notice. Preserve a later
+                # HTTP failure as a terminal Responses error, never raw JSON.
+                import json
+                error_body.extend(message.get('body', b''))
+                if message.get('more_body', False):
+                    return
+                try:
+                    detail = json.loads(error_body).get('detail', 'Gateway request failed')
+                except (ValueError, AttributeError):
+                    detail = 'Gateway request failed'
+                event = dict(type='response.failed', response=dict(status='failed',
+                             error=dict(code=str(error_status), message=str(detail))))
+                message = dict(type='http.response.body', more_body=False,
+                               body=('data: ' + json.dumps(event) + '\n\n').encode())
+            await send(message)
+
+        notice_token = _WAIT_NOTICES.set(dict(enabled=False, notify=notify))
         try:
-            return await self.app(scope, receive, send)
+            return await self.app(scope, receive, forward)
         finally:
             for lease in leases:
                 lease.release()
             _REQUEST_LEASES.reset(token)
+            _WAIT_NOTICES.reset(notice_token)
 
 
 def release_tracked_account(manager, email):
@@ -330,6 +405,7 @@ async def acquire_serially(manager, model, run_in_threadpool):
                         "no request sent to Google",
                         headers={"Retry-After": str(max(1, int(remaining) + 1))})
                 log_pause("waiting out a %ds cooldown before sending anything to Google" % (int(remaining) + 1))
+                await notify_wait(remaining)
                 wait_budget -= remaining
                 await asyncio.sleep(remaining)
                 # The wait is not queue contention: give the busy check its
